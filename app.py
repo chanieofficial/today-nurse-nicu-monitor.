@@ -104,7 +104,12 @@ with st.sidebar:
     patient = PATIENTS[pid]
     day = st.date_input("Monitoring sheet date", value=date.today())
     st.caption("Select the date once. Entries below are linked to this patient and date.")
-
+if not patients:
+    st.warning(
+        "No patients are registered yet. "
+        "Please add a patient before recording measurements."
+    )
+    st.stop()
 # LESSON 8: Live dashboard summary cards
 
 with connect() as c:
