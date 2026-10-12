@@ -83,7 +83,27 @@ def add_fluids(pid, day, iv, feeds, meds, other_in, urine, stools, other_out, ho
     net = total_in - total_out
     urine_rate = urine / (weight_g / 1000) / hours
 
-    # Keep your existing database INSERT and return statement here.
+    
+    with connect() as c:
+        c.execute(
+            """INSERT INTO daily_fluids (
+                patient_id, monitor_date, saved_utc,
+                iv_ml, feeds_ml, meds_ml, other_in_ml,
+                urine_ml, stool_count, other_out_ml,
+                hours, total_in, total_out, net_ml,
+                urine_ml_kg_hr
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                pid, day.isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+                iv, feeds, meds, other_in,
+                urine, int(stools), other_out,
+                hours, total_in, total_out, net, urine_rate
+            )
+        )
+
+    return total_in, total_out, net, urine_rate
+
 
 
 init_db()
