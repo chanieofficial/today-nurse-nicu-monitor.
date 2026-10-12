@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import date, datetime, timezone
 import streamlit as st
+import pandas as pd
 
 DB = "today_nurse_demo.db"
 PATIENTS = {
@@ -140,6 +141,81 @@ with tab2:
                      use_container_width=True, hide_index=True)
     else:
         st.info("No fluid records saved for this patient and date.")
+
+# LESSON 4: Daily summary and vital-sign trends
+st.divider()
+st.subheader("4. Daily summary and vital-sign trends")
+
+with connect() as c:
+    trend_rows = c.execute(
+        """
+        SELECT obs_time, hr, rr, temp_c
+        FROM daily_observations
+        WHERE patient_id = ? AND monitor_date = ?
+        ORDER BY obs_time ASC, id ASC
+        """,
+        (pid, day.isoformat())
+    ).fetchall()
+
+if trend_rows:
+    latest = trend_rows[-1]
+
+    st.caption(
+        "Summary of saved observations for the selected "
+        "fictional patient and monitoring date."
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Observations", len(trend_rows))
+    m2.metric("Latest HR", f"{latest[1]} bpm")
+    m3.metric("Latest RR", f"{latest[2]} /min")
+
+    st.write(
+        f"Latest temperature: **{latest[3]:.1f} °C** "
+        f"at **{latest[0]}**"
+    )
+
+    chart_tab1, chart_tab2, chart_tab3 = st.tabs(
+        ["Heart rate", "Respiratory rate", "Temperature"]
+    )
+
+    times = [row[0] for row in trend_rows]
+
+    with chart_tab1:
+        df = pd.DataFrame({
+            "Time": times,
+            "Heart rate (bpm)": [row[1] for row in trend_rows]
+        }).set_index("Time")
+        st.line_chart(df)
+
+    with chart_tab2:
+        df = pd.DataFrame({
+            "Time": times,
+            "Respiratory rate (/min)": [
+                row[2] for row in trend_rows
+            ]
+        }).set_index("Time")
+        st.line_chart(df)
+
+    with chart_tab3:
+        df = pd.DataFrame({
+            "Time": times,
+            "Temperature (°C)": [
+                row[3] for row in trend_rows
+            ]
+        }).set_index("Time")
+        st.line_chart(df)
+
+else:
+    st.info(
+        "No saved observations for this patient and date. "
+        "Save a fictional observation to display the summary."
+    )
+
+st.caption(
+    "Educational demonstration only. Charts and summaries "
+    "are not validated clinical decision-support tools."
+)
 
 with st.expander("Dates with saved records"):
     with connect() as c:
