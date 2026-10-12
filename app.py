@@ -216,7 +216,7 @@ st.caption(
     "Educational demonstration only. Charts and summaries "
     "are not validated clinical decision-support tools."
 )
-Add pandas as a dependency for daily NICU vital-sign summaries and trend charts. Uses fictional patient data for educational demonstration only. Not for clinical use.
+ 
 with st.expander("Dates with saved records"):
     with connect() as c:
         dates = c.execute("""SELECT DISTINCT monitor_date FROM (
