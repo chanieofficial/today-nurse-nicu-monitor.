@@ -71,6 +71,77 @@ with st.sidebar:
     day = st.date_input("Monitoring sheet date", value=date.today())
     st.caption("Select the date once. Entries below are linked to this patient and date.")
 
+# LESSON 8: Live dashboard summary cards
+
+with connect() as c:
+    latest_obs = c.execute(
+        """
+        SELECT obs_time, hr, rr, temp_c, spo2
+        FROM daily_observations
+        WHERE patient_id = ? AND monitor_date = ?
+        ORDER BY obs_time DESC, id DESC
+        LIMIT 1
+        """,
+        (pid, day.isoformat())
+    ).fetchone()
+
+    observation_count = c.execute(
+        """
+        SELECT COUNT(*)
+        FROM daily_observations
+        WHERE patient_id = ? AND monitor_date = ?
+        """,
+        (pid, day.isoformat())
+    ).fetchone()[0]
+
+    fluid_totals = c.execute(
+        """
+        SELECT
+            COALESCE(SUM(total_in), 0),
+            COALESCE(SUM(total_out), 0)
+        FROM daily_fluids
+        WHERE patient_id = ? AND monitor_date = ?
+        """,
+        (pid, day.isoformat())
+    ).fetchone()
+
+st.subheader("Dashboard overview")
+
+if latest_obs:
+    st.caption(f"Latest observation recorded at {latest_obs[0]}")
+
+    cols = st.columns(4)
+
+    cols[0].metric(
+        "Heart rate",
+        f"{latest_obs[1]} bpm" if latest_obs[1] is not None else "N/A"
+    )
+    cols[1].metric(
+        "Respiratory rate",
+        f"{latest_obs[2]} /min" if latest_obs[2] is not None else "N/A"
+    )
+    cols[2].metric(
+        "Temperature",
+        f"{latest_obs[3]} °C" if latest_obs[3] is not None else "N/A"
+    )
+    cols[3].metric(
+        "SpO₂",
+        f"{latest_obs[4]}%" if latest_obs[4] is not None else "N/A"
+    )
+else:
+    st.info("No vital-sign observations are saved for this patient and date.")
+
+col_a, col_b, col_c = st.columns(3)
+
+col_a.metric("Observations recorded", observation_count)
+col_b.metric("Total fluid intake", f"{fluid_totals[0]:.1f} mL")
+col_c.metric("Total fluid output", f"{fluid_totals[1]:.1f} mL")
+
+st.caption(
+    "Values reflect saved fictional records only. "
+    "They are not clinical alerts or treatment recommendations."
+)
+
 a, b, c = st.columns(3)
 a.metric("Demo ID", pid)
 b.metric("Gestational age", patient["gestation"])
