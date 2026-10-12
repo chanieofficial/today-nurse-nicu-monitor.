@@ -57,6 +57,14 @@ st.title("🩺 Today Nurse")
 st.subheader("NICU Digital Monitoring System · Lesson 3")
 st.warning("PUBLIC EDUCATIONAL DEMO ONLY. Fictional data only. No login/access controls. Never enter real patient information. Not for clinical care.")
 
+# LESSON 8: Dashboard overview
+st.caption("Educational NICU monitoring prototype | Version 0.8")
+
+st.info(
+    "DEMO ONLY: Use fictional data. "
+    "This prototype is not validated for clinical decisions."
+)
+
 with st.sidebar:
     pid = st.selectbox("Fictional patient", list(PATIENTS))
     patient = PATIENTS[pid]
