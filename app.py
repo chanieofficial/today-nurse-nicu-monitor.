@@ -274,6 +274,55 @@ else:
         "for this patient and date."
     )
 
+# LESSON 7: Fluid records table and CSV export
+st.divider()
+st.subheader("7. Fluid records and CSV export")
+
+with connect() as c:
+    fluid_rows = c.execute(
+        """
+        SELECT
+            saved_utc, iv_ml, feeds_ml, meds_ml, other_in_ml,
+            urine_ml, stool_count, other_out_ml, hours,
+            total_in, total_out, net_ml, urine_ml_kg_hr
+        FROM daily_fluids
+        WHERE patient_id = ? AND monitor_date = ?
+        ORDER BY saved_utc ASC, id ASC
+        """,
+        (pid, day.isoformat())
+    ).fetchall()
+
+if fluid_rows:
+    fluid_df = pd.DataFrame(
+        fluid_rows,
+        columns=[
+            "Saved at (UTC)", "IV fluids (mL)", "Feeds (mL)",
+            "Medications (mL)", "Other intake (mL)", "Urine (mL)",
+            "Stool count", "Other output (mL)", "Hours",
+            "Total intake (mL)", "Total output (mL)",
+            "Net balance (mL)", "Urine output (mL/kg/hr)"
+        ]
+    )
+
+    st.write(f"**Patient:** {pid}  |  **Date:** {day.strftime('%d %b %Y')}")
+    st.dataframe(fluid_df, use_container_width=True, hide_index=True)
+
+    fluid_csv = fluid_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="Download fluid records (CSV)",
+        data=fluid_csv,
+        file_name=f"{pid}_{day.isoformat()}_fluid_records.csv",
+        mime="text/csv",
+        key="fluid_records_csv"
+    )
+else:
+    st.info("No fluid records are available for this patient and date.")
+
+st.caption(
+    "Educational export using fictional data only. "
+    "Not validated for clinical decision-making."
+)
+
 with st.expander("Dates with saved records"):
     with connect() as c:
         dates = c.execute("""SELECT DISTINCT monitor_date FROM (
