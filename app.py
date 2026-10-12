@@ -1,148 +1,160 @@
-
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import streamlit as st
 
-DB_PATH = "today_nurse_demo.db"
+DB = "today_nurse_demo.db"
+PATIENTS = {
+    "DEMO-001": {"name": "Baby A (fictional)", "gestation": "32 weeks", "weight_g": 1650},
+    "DEMO-002": {"name": "Baby B (fictional)", "gestation": "35 weeks", "weight_g": 2200},
+}
+st.set_page_config(page_title="Today Nurse | Daily NICU Monitoring", page_icon="🩺", layout="wide")
 
-st.set_page_config(page_title="Today Nurse | NICU Demo", page_icon="🩺", layout="wide")
-
-# Educational prototype only. Never enter real patient information.
-# Public visitors may add/read fictional records. Cloud local storage may reset.
+def connect():
+    return sqlite3.connect(DB)
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    with connect() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+            monitor_date TEXT NOT NULL, saved_utc TEXT NOT NULL, obs_time TEXT NOT NULL,
             hr INTEGER NOT NULL, rr INTEGER NOT NULL, temp_c REAL NOT NULL,
-            spo2 INTEGER NOT NULL, fio2 INTEGER NOT NULL, support TEXT NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS fluid_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
-            iv_ml REAL NOT NULL, feeds_ml REAL NOT NULL, other_in_ml REAL NOT NULL,
-            urine_ml REAL NOT NULL, other_out_ml REAL NOT NULL, hours REAL NOT NULL,
-            total_in_ml REAL NOT NULL, total_out_ml REAL NOT NULL,
-            net_ml REAL NOT NULL, urine_ml_kg_hr REAL NOT NULL
-        )""")
+            spo2 INTEGER NOT NULL, fio2 INTEGER NOT NULL, support TEXT NOT NULL, note TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_fluids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+            monitor_date TEXT NOT NULL, saved_utc TEXT NOT NULL, iv_ml REAL NOT NULL,
+            feeds_ml REAL NOT NULL, meds_ml REAL NOT NULL, other_in_ml REAL NOT NULL,
+            urine_ml REAL NOT NULL, stool_count INTEGER NOT NULL, other_out_ml REAL NOT NULL,
+            hours REAL NOT NULL, total_in REAL NOT NULL, total_out REAL NOT NULL,
+            net_ml REAL NOT NULL, urine_ml_kg_hr REAL NOT NULL)""")
 
-def now_utc():
+def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def save_observation(patient_id, hr, rr, temp, spo2, fio2, support):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""INSERT INTO observations
-            (patient_id, recorded_at, hr, rr, temp_c, spo2, fio2, support)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (patient_id, now_utc(), hr, rr, temp, spo2, fio2, support))
+def add_observation(pid, day, t, hr, rr, temp, spo2, fio2, support, note):
+    with connect() as c:
+        c.execute("""INSERT INTO daily_observations
+        (patient_id, monitor_date, saved_utc, obs_time, hr, rr, temp_c, spo2, fio2, support, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pid, day.isoformat(), timestamp(), t.strftime("%H:%M"), hr, rr, temp, spo2, fio2, support, note))
 
-def save_fluids(patient_id, values):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""INSERT INTO fluid_records
-            (patient_id, recorded_at, iv_ml, feeds_ml, other_in_ml, urine_ml,
-             other_out_ml, hours, total_in_ml, total_out_ml, net_ml, urine_ml_kg_hr)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (patient_id, now_utc(), *values))
-
-def read_rows(table, patient_id):
-    allowed = {"observations", "fluid_records"}
-    if table not in allowed:
-        raise ValueError("Unsupported table")
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            f"SELECT * FROM {table} WHERE patient_id = ? ORDER BY id DESC LIMIT 20",
-            (patient_id,)
-        ).fetchall()
-
-init_db()
-st.title("🩺 Today Nurse")
-st.subheader("NICU Digital Monitoring System · Lesson 2")
-st.warning("PUBLIC EDUCATIONAL DEMO ONLY. Use fictional data only. Entries may be visible to other visitors and may be lost after hosting restarts. Never enter real patient information.")
-
-with st.sidebar:
-    patient_id = st.selectbox("Fictional patient", ["DEMO-001", "DEMO-002"])
-    if patient_id == "DEMO-001":
-        gestation, weight_g = "32 weeks", 1650
-    else:
-        gestation, weight_g = "35 weeks", 2200
-    st.caption("All patient details are fictional.")
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Demo ID", patient_id)
-c2.metric("Gestational age", gestation)
-c3.metric("Weight", f"{weight_g:,} g")
-
-st.divider()
-st.markdown("### 1. Save a practice vital-sign observation")
-with st.form("obs_form"):
-    a, b = st.columns(2)
-    with a:
-        hr = st.number_input("Heart rate (bpm)", 0, 300, 140)
-        rr = st.number_input("Respiratory rate (/min)", 0, 150, 45)
-        temp = st.number_input("Temperature (°C)", 25.0, 45.0, 36.7, step=0.1)
-    with b:
-        spo2 = st.number_input("SpO₂ (%)", 0, 100, 96)
-        fio2 = st.number_input("FiO₂ (%)", 21, 100, 21)
-        support = st.selectbox("Respiratory support", ["Room air", "Oxygen", "CPAP", "Other / not specified"])
-    submit_obs = st.form_submit_button("Save observation")
-if submit_obs:
-    save_observation(patient_id, hr, rr, temp, spo2, fio2, support)
-    st.success("Saved to the SQLite demo database.")
-
-st.divider()
-st.markdown("### 2. Calculate and save practice intake/output")
-with st.form("fluid_form"):
-    a, b = st.columns(2)
-    with a:
-        iv = st.number_input("IV fluid (mL)", 0.0, 5000.0, 120.0, step=1.0)
-        feeds = st.number_input("Feeds (mL)", 0.0, 2000.0, 80.0, step=1.0)
-        other_in = st.number_input("Other intake (mL)", 0.0, 2000.0, 0.0, step=1.0)
-    with b:
-        urine = st.number_input("Urine (mL)", 0.0, 5000.0, 90.0, step=1.0)
-        other_out = st.number_input("Other output (mL)", 0.0, 5000.0, 5.0, step=1.0)
-        hours = st.number_input("Monitoring interval (hours)", 1.0, 24.0, 24.0, step=1.0)
-    submit_fluid = st.form_submit_button("Calculate and save fluid record")
-if submit_fluid:
-    total_in = iv + feeds + other_in
+def add_fluids(pid, day, iv, feeds, meds, other_in, urine, stools, other_out, hours, weight_g):
+    total_in = iv + feeds + meds + other_in
     total_out = urine + other_out
     net = total_in - total_out
     urine_rate = urine / (weight_g / 1000) / hours
-    save_fluids(patient_id, [iv, feeds, other_in, urine, other_out, hours, total_in, total_out, net, urine_rate])
-    x1, x2, x3, x4 = st.columns(4)
-    x1.metric("Total intake", f"{total_in:.1f} mL")
-    x2.metric("Total output", f"{total_out:.1f} mL")
-    x3.metric("Net balance", f"{net:+.1f} mL")
-    x4.metric("Urine output", f"{urine_rate:.2f} mL/kg/hr")
-    st.success("Fluid record saved.")
+    with connect() as c:
+        c.execute("""INSERT INTO daily_fluids
+        (patient_id, monitor_date, saved_utc, iv_ml, feeds_ml, meds_ml, other_in_ml,
+        urine_ml, stool_count, other_out_ml, hours, total_in, total_out, net_ml, urine_ml_kg_hr)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pid, day.isoformat(), timestamp(), iv, feeds, meds, other_in, urine, stools,
+         other_out, hours, total_in, total_out, net, urine_rate))
+    return total_in, total_out, net, urine_rate
+
+init_db()
+st.title("🩺 Today Nurse")
+st.subheader("NICU Digital Monitoring System · Lesson 3")
+st.warning("PUBLIC EDUCATIONAL DEMO ONLY. Fictional data only. No login/access controls. Never enter real patient information. Not for clinical care.")
+
+with st.sidebar:
+    pid = st.selectbox("Fictional patient", list(PATIENTS))
+    patient = PATIENTS[pid]
+    day = st.date_input("Monitoring sheet date", value=date.today())
+    st.caption("Select the date once. Entries below are linked to this patient and date.")
+
+a, b, c = st.columns(3)
+a.metric("Demo ID", pid)
+b.metric("Gestational age", patient["gestation"])
+c.metric("Weight", f'{patient["weight_g"]:,} g')
+st.write(f'**Display name:** {patient["name"]}  |  **Monitoring date:** {day.strftime("%d %b %Y")}')
+st.divider()
+
+st.markdown("### 1. Add a timed vital-sign observation")
+with st.form("obs_form"):
+    x, y = st.columns(2)
+    with x:
+        obs_time = st.time_input("Observation time", value=datetime.now().time().replace(second=0, microsecond=0))
+        hr = st.number_input("Heart rate (bpm)", 0, 300, 140)
+        rr = st.number_input("Respiratory rate (/min)", 0, 150, 45)
+        temp = st.number_input("Temperature (°C)", 25.0, 45.0, 36.7, step=0.1)
+    with y:
+        spo2 = st.number_input("SpO₂ (%)", 0, 100, 96)
+        fio2 = st.number_input("FiO₂ (%)", 21, 100, 21)
+        support = st.selectbox("Respiratory support", ["Room air", "Oxygen", "CPAP", "Other / not specified"])
+    note = st.text_input("Fictional nursing note (no identifiers)")
+    save_obs = st.form_submit_button("Save observation to daily sheet")
+if save_obs:
+    add_observation(pid, day, obs_time, hr, rr, temp, spo2, fio2, support, note)
+    st.success(f"Saved for {pid} on {day.isoformat()} at {obs_time.strftime('%H:%M')}.")
 
 st.divider()
-st.markdown("### 3. Saved practice records")
-tab1, tab2 = st.tabs(["Vital signs", "Fluid records"])
+st.markdown("### 2. Add an intake/output record")
+with st.form("fluid_form"):
+    x, y = st.columns(2)
+    with x:
+        iv = st.number_input("IV fluids (mL)", 0.0, 5000.0, 120.0, step=1.0)
+        feeds = st.number_input("Feeds (mL)", 0.0, 2000.0, 80.0, step=1.0)
+        meds = st.number_input("Medication fluid volume (mL)", 0.0, 2000.0, 0.0, step=1.0)
+        other_in = st.number_input("Other intake (mL)", 0.0, 2000.0, 0.0, step=1.0)
+    with y:
+        urine = st.number_input("Urine (mL)", 0.0, 5000.0, 90.0, step=1.0)
+        stools = st.number_input("Stool count", 0, 50, 1)
+        other_out = st.number_input("Other measured output (mL)", 0.0, 5000.0, 5.0, step=1.0)
+        hours = st.number_input("Monitoring interval (hours)", 1.0, 24.0, 24.0, step=1.0)
+    save_fluid = st.form_submit_button("Calculate and save fluid record")
+if save_fluid:
+    totals = add_fluids(pid, day, iv, feeds, meds, other_in, urine, stools, other_out, hours, patient["weight_g"])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total intake", f"{totals[0]:.1f} mL")
+    m2.metric("Total output", f"{totals[1]:.1f} mL")
+    m3.metric("Net balance", f"{totals[2]:+.1f} mL")
+    m4.metric("Urine output", f"{totals[3]:.2f} mL/kg/hr")
+    st.success("Fluid record saved.")
+
+st.caption("Calculations are for software-learning only. Verify definitions and methods against approved local protocols before any clinical use.")
+st.divider()
+st.markdown("### 3. Records for this patient and date")
+tab1, tab2 = st.tabs(["Vital-sign observations", "Intake/output records"])
 with tab1:
-    rows = read_rows("observations", patient_id)
+    with connect() as c:
+        rows = c.execute("""SELECT obs_time, hr, rr, temp_c, spo2, fio2, support, note, saved_utc
+        FROM daily_observations WHERE patient_id=? AND monitor_date=? ORDER BY obs_time, id""",
+        (pid, day.isoformat())).fetchall()
     if rows:
-        st.dataframe([{"Recorded (UTC)": r[2], "HR": r[3], "RR": r[4], "Temp °C": r[5],
-                       "SpO₂ %": r[6], "FiO₂ %": r[7], "Support": r[8]} for r in rows],
+        st.dataframe([{"Time":r[0],"HR":r[1],"RR":r[2],"Temp °C":r[3],"SpO₂ %":r[4],
+                       "FiO₂ %":r[5],"Support":r[6],"Note":r[7],"Saved UTC":r[8]} for r in rows],
                      use_container_width=True, hide_index=True)
     else:
-        st.info("No saved observations yet.")
+        st.info("No observations saved for this patient and date.")
 with tab2:
-    rows = read_rows("fluid_records", patient_id)
+    with connect() as c:
+        rows = c.execute("""SELECT saved_utc, iv_ml, feeds_ml, meds_ml, other_in_ml, urine_ml,
+        stool_count, other_out_ml, hours, total_in, total_out, net_ml, urine_ml_kg_hr
+        FROM daily_fluids WHERE patient_id=? AND monitor_date=? ORDER BY id DESC""",
+        (pid, day.isoformat())).fetchall()
     if rows:
-        st.dataframe([{"Recorded (UTC)": r[2], "Intake mL": r[9], "Output mL": r[10],
-                       "Net mL": r[11], "Urine mL/kg/hr": r[12]} for r in rows],
+        st.dataframe([{"Saved UTC":r[0],"IV mL":r[1],"Feeds mL":r[2],"Medication fluids mL":r[3],
+                       "Other intake mL":r[4],"Urine mL":r[5],"Stools":r[6],"Other output mL":r[7],
+                       "Interval h":r[8],"Total intake mL":r[9],"Total output mL":r[10],
+                       "Net mL":r[11],"Urine mL/kg/hr":round(r[12],3)} for r in rows],
                      use_container_width=True, hide_index=True)
     else:
-        st.info("No saved fluid records yet.")
+        st.info("No fluid records saved for this patient and date.")
 
-with st.expander("Lesson 2: what the new code does"):
+with st.expander("Dates with saved records"):
+    with connect() as c:
+        dates = c.execute("""SELECT DISTINCT monitor_date FROM (
+            SELECT monitor_date FROM daily_observations WHERE patient_id=?
+            UNION SELECT monitor_date FROM daily_fluids WHERE patient_id=?
+        ) ORDER BY monitor_date DESC""", (pid, pid)).fetchall()
+    st.write(", ".join(r[0] for r in dates) if dates else "No saved dates yet.")
+
+with st.expander("Lesson 3: what changed?"):
     st.markdown("""
-    - **SQLite** stores records in a database file.
-    - `CREATE TABLE` defines the columns.
-    - `INSERT` saves a new record.
-    - `SELECT` retrieves saved records.
-    - `?` placeholders keep user-entered values separate from SQL instructions.
+    - Select a patient and monitoring date once.
+    - Each vital-sign entry is linked to that patient, date, and observation time.
+    - Fluid records are also linked to the selected patient and date.
+    - The screen filters records by patient and date.
+    - This remains a public demo using local SQLite storage, which may be reset by the host.
     """)
-
-st.caption("Today Nurse · Educational prototype · Version 0.2 · Not for clinical use")
+st.caption("Today Nurse · Educational prototype · Version 0.3 · Not for clinical use")

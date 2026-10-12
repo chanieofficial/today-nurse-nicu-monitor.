@@ -1,16 +1,15 @@
-# Today Nurse NICU Digital Monitoring System — Lesson 2
+# Today Nurse NICU Digital Monitoring System — Lesson 3
 
-Beginner project using Python, Streamlit and SQLite.
+Educational prototype built with Python, Streamlit and SQLite.
 
-## Demonstrates
-- Saving fictional vital-sign observations
-- Saving fictional intake/output records
-- Calculating intake, output, net balance and urine output
-- Displaying recent saved demo records
+Features:
+- Select a fictional patient and one monitoring date.
+- Save time-stamped vital-sign observations linked to that patient/date.
+- Save intake/output entries linked to that patient/date.
+- Filter saved records by patient and date.
 
-## Important limitations
-This is a public educational prototype with no authentication or role permissions. Visitors may view/add fictional records. Never enter real patient data. SQLite on the hosting app's local filesystem is not guaranteed permanent; records may be lost on restart or redeployment. Not approved for clinical care.
+Deploy:
+Upload `app.py` and `requirements.txt` to the root of the GitHub repository and set Streamlit's main file path to `app.py`.
 
-## Run
-`pip install -r requirements.txt`
-`streamlit run app.py`
+Safety:
+Use fictional data only. This public app has no authentication or access controls. Local SQLite storage on the host is not guaranteed permanent. Not clinically validated or approved for patient care.
