@@ -182,14 +182,37 @@ with st.form("fluid_form"):
         other_out = st.number_input("Other measured output (mL)", 0.0, 5000.0, 5.0, step=1.0)
         hours = st.number_input("Monitoring interval (hours)", 1.0, 24.0, 24.0, step=1.0)
     save_fluid = st.form_submit_button("Calculate and save fluid record")
+
 if save_fluid:
-    totals = add_fluids(pid, day, iv, feeds, meds, other_in, urine, stools, other_out, hours, patient["weight_g"])
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total intake", f"{totals[0]:.1f} mL")
-    m2.metric("Total output", f"{totals[1]:.1f} mL")
-    m3.metric("Net balance", f"{totals[2]:+.1f} mL")
-    m4.metric("Urine output", f"{totals[3]:.2f} mL/kg/hr")
-    st.success("Fluid record saved.")
+    weight_g = patient["weight_g"]
+
+    if hours <= 0:
+        st.error("Monitoring interval must be greater than zero.")
+    elif weight_g is None or weight_g <= 0:
+        st.error("A valid patient weight is required.")
+    elif any(v < 0 for v in [
+        iv, feeds, meds, other_in, urine, stools, other_out
+    ]):
+        st.error("Fluid inputs cannot be negative.")
+    elif not float(stools).is_integer():
+        st.error("Stool count must be a whole number.")
+    else:
+        try:
+            totals = add_fluids(
+                pid, day, iv, feeds, meds, other_in,
+                urine, int(stools), other_out, hours, weight_g
+            )
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total intake", f"{totals[0]:.1f} mL")
+            m2.metric("Total output", f"{totals[1]:.1f} mL")
+            m3.metric("Net balance", f"{totals[2]:+.1f} mL")
+            m4.metric("Urine output", f"{totals[3]:.2f} mL/kg/hr")
+
+            st.success("Fluid record saved.")
+        except (ValueError, TypeError, ZeroDivisionError) as exc:
+            st.error(f"Unable to save fluid record: {exc}")
+
 
 st.caption("Calculations are for software-learning only. Verify definitions and methods against approved local protocols before any clinical use.")
 st.divider()
