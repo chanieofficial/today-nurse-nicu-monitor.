@@ -246,7 +246,11 @@ if save_fluid:
             st.success("Fluid record saved.")
         except (ValueError, TypeError, ZeroDivisionError) as exc:
             st.error(f"Unable to save fluid record: {exc}")
-
+        except sqlite3.Error:
+            st.error(
+                "The fluid record could not be saved because of a "
+                "database error. Please try again."
+            )
 
 st.caption("Calculations are for software-learning only. Verify definitions and methods against approved local protocols before any clinical use.")
 st.divider()
