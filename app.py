@@ -217,6 +217,63 @@ st.caption(
     "are not validated clinical decision-support tools."
 )
  
+# LESSON 6: Daily fluid balance summary
+st.divider()
+st.subheader("6. Daily fluid balance summary")
+
+with connect() as c:
+    fluid_summary = c.execute(
+        """
+        SELECT
+            COALESCE(SUM(total_in), 0),
+            COALESCE(SUM(total_out), 0),
+            COALESCE(SUM(net_ml), 0),
+            COALESCE(SUM(urine_ml), 0),
+            COALESCE(SUM(hours), 0),
+            COALESCE(SUM(stool_count), 0),
+            CASE
+                WHEN COALESCE(SUM(hours), 0) > 0
+                THEN SUM(
+                    COALESCE(urine_ml_kg_hr, 0) * COALESCE(hours, 0)
+                ) / SUM(hours)
+                ELSE NULL
+            END
+        FROM daily_fluids
+        WHERE patient_id = ? AND monitor_date = ?
+        """,
+        (pid, day.isoformat())
+    ).fetchone()
+
+total_in, total_out, net_balance, urine_total, total_hours, stools, urine_rate = fluid_summary
+
+st.write(f"**Patient:** {pid}  |  **Date:** {day.strftime('%d %b %Y')}")
+
+if total_hours > 0:
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric("Total intake", f"{total_in:.1f} mL")
+        st.metric("Total output", f"{total_out:.1f} mL")
+    
+    with col2:
+        st.metric("Net fluid balance", f"{net_balance:+.1f} mL")
+        st.metric("Urine output", f"{urine_rate:.2f} mL/kg/hr"
+                  if urine_rate is not None else "Not available")
+
+    st.write(f"**Total recorded urine:** {urine_total:.1f} mL")
+    st.write(f"**Recorded monitoring hours:** {total_hours:.1f}")
+    st.write(f"**Recorded stool count:** {int(stools or 0)}")
+
+    st.caption(
+        "Educational summary of recorded fictional data only. "
+        "Verify calculations before any clinical use."
+    )
+else:
+    st.info(
+        "No fluid records with recorded monitoring hours exist "
+        "for this patient and date."
+    )
+
 with st.expander("Dates with saved records"):
     with connect() as c:
         dates = c.execute("""SELECT DISTINCT monitor_date FROM (
