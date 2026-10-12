@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 DB = "today_nurse_demo.db"
-APP_VERSION = "0.9"
+APP_VERSION = "1.0"
 PATIENTS = {
     "DEMO-001": {
         "name": "Baby A (fictional)",
@@ -22,7 +22,7 @@ PATIENTS = {
 }
 
 st.set_page_config(
-    page_title="Today Nurse | Daily NICU Monitoring",
+    page_title="Today Nurse | NICU Nursing Documentation",
     page_icon="🩺",
     layout="wide",
 )
@@ -95,6 +95,59 @@ def init_db():
                 "ALTER TABLE daily_fluids "
                 "ADD COLUMN weight_g REAL NOT NULL DEFAULT 1"
             )
+
+        # Additional nursing-documentation modules. These store documentation only;
+        # they do not prescribe, calculate, or authorize clinical treatment.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nicu_admissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+                admission_date TEXT NOT NULL, admission_time TEXT NOT NULL,
+                gestational_age TEXT, birth_weight_g REAL, current_weight_g REAL,
+                sex TEXT, delivery_mode TEXT, apgar TEXT, admission_reason TEXT NOT NULL,
+                maternal_perinatal_history TEXT, initial_condition TEXT,
+                respiratory_support TEXT, lines_devices TEXT, initial_assessment TEXT,
+                nursing_priorities TEXT, created_utc TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS medication_administration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+                record_date TEXT NOT NULL, medication TEXT NOT NULL, prescribed_dose TEXT NOT NULL,
+                route TEXT NOT NULL, scheduled_time TEXT, status TEXT NOT NULL,
+                administration_time TEXT, weight_g REAL, allergy_check INTEGER NOT NULL,
+                independent_double_check INTEGER NOT NULL, nurse_name TEXT,
+                reason_or_indication TEXT, omission_reason TEXT, notes TEXT, created_utc TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS head_to_toe_assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+                assessment_date TEXT NOT NULL, assessment_time TEXT NOT NULL,
+                neuro TEXT, respiratory TEXT, cardiovascular TEXT, temperature_skin TEXT,
+                gi_feeding TEXT, genitourinary TEXT, musculoskeletal TEXT,
+                lines_tubes TEXT, pain_score TEXT, infection_risk TEXT,
+                findings_interventions TEXT, escalation TEXT, nurse_name TEXT, created_utc TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS patient_handovers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+                handover_date TEXT NOT NULL, handover_time TEXT NOT NULL,
+                outgoing_nurse TEXT, incoming_nurse TEXT, situation TEXT NOT NULL,
+                background TEXT, assessment TEXT, recommendation TEXT,
+                pending_tasks TEXT, escalation_plan TEXT, acknowledgement TEXT, created_utc TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS equipment_handovers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL,
+                handover_date TEXT NOT NULL, handover_time TEXT NOT NULL,
+                equipment_type TEXT NOT NULL, equipment_id TEXT, condition_status TEXT NOT NULL,
+                function_check TEXT, alarm_check TEXT, power_gas_check TEXT,
+                consumables_check TEXT, fault_or_issue TEXT, action_taken TEXT,
+                outgoing_staff TEXT, incoming_staff TEXT, notes TEXT, created_utc TEXT NOT NULL
+            )
+        """)
 
 
 def timestamp_utc():
@@ -203,7 +256,7 @@ def add_fluids(
 init_db()
 
 st.title("🩺 Today Nurse")
-st.subheader("NICU Digital Monitoring System · Version 0.9")
+st.subheader("NICU Monitoring & Nursing Documentation System · Version 1.0")
 st.warning(
     "PUBLIC EDUCATIONAL DEMO ONLY. Use fictional data only. "
     "No authentication or access controls. Never enter real patient information. "
@@ -536,16 +589,238 @@ if fluid_rows:
         key="fluid_records_csv",
     )
 
+
+st.divider()
+st.header("7. NICU Nursing Documentation")
+st.caption("These forms are linked to the selected fictional demo patient. Save only fictional training data in this public demo.")
+
+admission_tab, medication_tab, assessment_tab, patient_handover_tab, equipment_tab = st.tabs([
+    "🍼 Initial Admission", "💊 Medication Record", "🩺 Head-to-Toe Assessment",
+    "🤝 Patient Handover", "⚙️ Equipment Handover"
+])
+
+with admission_tab:
+    st.markdown("#### Initial NICU admission record")
+    with st.form("initial_admission_form"):
+        c1, c2, c3 = st.columns(3)
+        admission_date = c1.date_input("Admission date", value=day, key="adm_date")
+        admission_time = c2.text_input("Admission time (HH:MM)", value="08:00", key="adm_time")
+        sex = c3.selectbox("Sex", ["Not recorded", "Female", "Male", "Indeterminate / not documented"], key="adm_sex")
+        c4, c5, c6 = st.columns(3)
+        gestation = c4.text_input("Gestational age", value=patient["gestation"], help="Example: 32+4 weeks")
+        birth_weight = c5.number_input("Birth weight (g)", min_value=0, max_value=10000, value=int(patient["weight_g"]), step=10)
+        current_weight = c6.number_input("Current weight at admission (g)", min_value=0, max_value=10000, value=int(patient["weight_g"]), step=10)
+        c7, c8 = st.columns(2)
+        delivery_mode = c7.selectbox("Delivery mode", ["Not recorded", "Vaginal", "Caesarean", "Assisted vaginal", "Other / unknown"])
+        apgar = c8.text_input("Apgar scores", placeholder="e.g., 1 min / 5 min / 10 min")
+        reason = st.text_area("Reason for NICU admission *", placeholder="Document the stated clinical reason; do not enter real patient identifiers.")
+        maternal_history = st.text_area("Maternal and perinatal history", placeholder="Relevant pregnancy, maternal, delivery and resuscitation history")
+        initial_condition = st.text_area("Condition on arrival", placeholder="Appearance, activity, perfusion, temperature and other initial findings")
+        respiratory_support = st.text_input("Respiratory support", placeholder="Room air / oxygen / CPAP / ventilation, as documented")
+        lines_devices = st.text_area("Lines, tubes and devices", placeholder="Device type, site, status and checks")
+        initial_assessment = st.text_area("Initial assessment / key findings")
+        priorities = st.text_area("Initial nursing priorities and care plan")
+        save_admission = st.form_submit_button("Save admission record")
+    if save_admission:
+        if not reason.strip() or not admission_time.strip():
+            st.error("Admission reason and admission time are required.")
+        elif birth_weight <= 0 or current_weight <= 0:
+            st.error("Enter positive birth and current weights, or revise the form for a documented unknown value.")
+        else:
+            with connect() as conn:
+                conn.execute("""INSERT INTO nicu_admissions
+                    (patient_id, admission_date, admission_time, gestational_age, birth_weight_g, current_weight_g,
+                     sex, delivery_mode, apgar, admission_reason, maternal_perinatal_history, initial_condition,
+                     respiratory_support, lines_devices, initial_assessment, nursing_priorities, created_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, admission_date.isoformat(), admission_time.strip(), gestation.strip(), float(birth_weight),
+                     float(current_weight), sex, delivery_mode, apgar.strip(), reason.strip(), maternal_history.strip(),
+                     initial_condition.strip(), respiratory_support.strip(), lines_devices.strip(), initial_assessment.strip(),
+                     priorities.strip(), timestamp_utc()))
+            st.success("Admission record saved for the selected demo patient.")
+    with connect() as conn:
+        rows = conn.execute("SELECT id, admission_date, admission_time, gestational_age, admission_reason FROM nicu_admissions WHERE patient_id=? ORDER BY id DESC LIMIT 20", (pid,)).fetchall()
+    st.markdown("**Recent admission records**")
+    st.dataframe(pd.DataFrame(rows, columns=["ID", "Date", "Time", "Gestational age", "Admission reason"]), use_container_width=True, hide_index=True) if rows else st.info("No admission records saved yet.")
+
+with medication_tab:
+    st.markdown("#### Medication administration record (MAR)")
+    st.warning("Record the verified prescription exactly as ordered. This tool does not calculate or recommend neonatal doses.")
+    with st.form("medication_record_form"):
+        c1, c2, c3 = st.columns(3)
+        med_date = c1.date_input("Record date", value=day, key="med_date")
+        medication = c2.text_input("Medication name *")
+        prescribed_dose = c3.text_input("Prescribed dose as written *", placeholder="Include units and frequency from verified order")
+        c4, c5, c6 = st.columns(3)
+        route = c4.selectbox("Route *", ["Select route", "Oral / enteral", "IV", "IM", "SC", "Inhaled", "Topical", "Other"])
+        scheduled_time = c5.text_input("Scheduled time", placeholder="HH:MM")
+        status = c6.selectbox("Administration status", ["Administered", "Withheld", "Omitted", "Delayed", "Not given - other"])
+        c7, c8, c9 = st.columns(3)
+        administration_time = c7.text_input("Actual administration time", placeholder="HH:MM; leave blank if not given")
+        weight_used = c8.number_input("Weight referenced by prescription (g)", min_value=0, max_value=10000, value=int(patient["weight_g"]), step=10)
+        nurse_name = c9.text_input("Administering / documenting nurse")
+        allergy_check = st.checkbox("Allergy status checked against available record")
+        double_check = st.checkbox("Independent double-check documented where required by policy")
+        indication = st.text_input("Indication / reason")
+        omission_reason = st.text_input("Reason withheld, omitted or delayed (if applicable)")
+        med_notes = st.text_area("Additional notes / response / follow-up")
+        save_med = st.form_submit_button("Save medication record")
+    if save_med:
+        if not medication.strip() or not prescribed_dose.strip() or route == "Select route":
+            st.error("Medication name, prescribed dose and route are required.")
+        elif status == "Administered" and not administration_time.strip():
+            st.error("Enter the actual administration time for a record marked administered.")
+        elif status != "Administered" and not omission_reason.strip():
+            st.error("Document the reason for a withheld, omitted, delayed or not-given dose.")
+        else:
+            with connect() as conn:
+                conn.execute("""INSERT INTO medication_administration
+                    (patient_id, record_date, medication, prescribed_dose, route, scheduled_time, status,
+                     administration_time, weight_g, allergy_check, independent_double_check, nurse_name,
+                     reason_or_indication, omission_reason, notes, created_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, med_date.isoformat(), medication.strip(), prescribed_dose.strip(), route, scheduled_time.strip(),
+                     status, administration_time.strip(), float(weight_used) if weight_used > 0 else None,
+                     int(allergy_check), int(double_check), nurse_name.strip(), indication.strip(), omission_reason.strip(),
+                     med_notes.strip(), timestamp_utc()))
+            st.success("Medication record saved. Verify it against the medication chart and local policy.")
+    with connect() as conn:
+        rows = conn.execute("SELECT id, record_date, medication, prescribed_dose, route, status, scheduled_time, administration_time, nurse_name FROM medication_administration WHERE patient_id=? ORDER BY id DESC LIMIT 50", (pid,)).fetchall()
+    st.markdown("**Recent medication records**")
+    st.dataframe(pd.DataFrame(rows, columns=["ID", "Date", "Medication", "Dose as prescribed", "Route", "Status", "Scheduled", "Actual time", "Nurse"]), use_container_width=True, hide_index=True) if rows else st.info("No medication records saved yet.")
+
+with assessment_tab:
+    st.markdown("#### Structured head-to-toe assessment")
+    with st.form("head_to_toe_form"):
+        c1, c2, c3 = st.columns(3)
+        assess_date = c1.date_input("Assessment date", value=day, key="assess_date")
+        assess_time = c2.text_input("Assessment time (HH:MM)", value="08:00", key="assess_time")
+        assess_nurse = c3.text_input("Nurse completing assessment")
+        neuro = st.text_area("Neurological", placeholder="State, activity, tone, responsiveness, fontanelle if assessed")
+        respiratory = st.text_area("Respiratory", placeholder="Work of breathing, air entry, support and relevant observations")
+        cardiovascular = st.text_area("Cardiovascular / perfusion", placeholder="Heart rate, pulses, colour, capillary refill, perfusion")
+        temperature_skin = st.text_area("Temperature / skin", placeholder="Temperature, skin integrity, jaundice, pressure injury risk")
+        gi_feeding = st.text_area("Gastrointestinal / feeding", placeholder="Abdomen, feeding plan/tolerance, emesis, stool")
+        genitourinary = st.text_area("Genitourinary / elimination", placeholder="Urine output and relevant findings")
+        musculoskeletal = st.text_area("Musculoskeletal / developmental care", placeholder="Movement, positioning, comfort and developmental support")
+        lines_tubes = st.text_area("Lines, tubes and devices", placeholder="Site, patency, securement and device checks")
+        c4, c5 = st.columns(2)
+        pain_score = c4.text_input("Pain assessment tool and score", placeholder="Name the tool used and record score")
+        infection_risk = c5.text_input("Infection risks / precautions")
+        findings_interventions = st.text_area("Summary of findings and nursing interventions")
+        escalation = st.text_area("Escalation, notification and follow-up required")
+        save_assessment = st.form_submit_button("Save head-to-toe assessment")
+    if save_assessment:
+        if not assess_time.strip():
+            st.error("Assessment time is required.")
+        elif not any([neuro.strip(), respiratory.strip(), cardiovascular.strip(), temperature_skin.strip(), gi_feeding.strip(), genitourinary.strip(), musculoskeletal.strip(), lines_tubes.strip()]):
+            st.error("Complete at least one assessment system before saving.")
+        else:
+            with connect() as conn:
+                conn.execute("""INSERT INTO head_to_toe_assessments
+                    (patient_id, assessment_date, assessment_time, neuro, respiratory, cardiovascular, temperature_skin,
+                     gi_feeding, genitourinary, musculoskeletal, lines_tubes, pain_score, infection_risk,
+                     findings_interventions, escalation, nurse_name, created_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, assess_date.isoformat(), assess_time.strip(), neuro.strip(), respiratory.strip(), cardiovascular.strip(),
+                     temperature_skin.strip(), gi_feeding.strip(), genitourinary.strip(), musculoskeletal.strip(), lines_tubes.strip(),
+                     pain_score.strip(), infection_risk.strip(), findings_interventions.strip(), escalation.strip(), assess_nurse.strip(), timestamp_utc()))
+            st.success("Head-to-toe assessment saved.")
+    with connect() as conn:
+        rows = conn.execute("SELECT id, assessment_date, assessment_time, nurse_name, neuro, respiratory, cardiovascular, findings_interventions FROM head_to_toe_assessments WHERE patient_id=? ORDER BY id DESC LIMIT 20", (pid,)).fetchall()
+    st.markdown("**Recent assessments**")
+    st.dataframe(pd.DataFrame(rows, columns=["ID", "Date", "Time", "Nurse", "Neurological", "Respiratory", "Cardiovascular", "Summary / interventions"]), use_container_width=True, hide_index=True) if rows else st.info("No assessments saved yet.")
+
+with patient_handover_tab:
+    st.markdown("#### Structured patient shift handover (SBAR)")
+    with st.form("patient_handover_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        handover_date = c1.date_input("Handover date", value=day, key="patient_handover_date")
+        handover_time = c2.text_input("Handover time (HH:MM)", value="07:00", key="patient_handover_time")
+        outgoing = c3.text_input("Outgoing nurse")
+        incoming = c4.text_input("Incoming nurse")
+        situation = st.text_area("S · Situation *", placeholder="Current condition and immediate concerns")
+        background = st.text_area("B · Background", placeholder="Relevant history, diagnosis and events during shift")
+        assessment = st.text_area("A · Assessment", placeholder="Current observations, respiratory support, feeding, fluids, access/devices")
+        recommendation = st.text_area("R · Recommendation / plan", placeholder="Priorities, monitoring, escalation thresholds from local protocol")
+        pending_tasks = st.text_area("Pending tasks / investigations")
+        escalation_plan = st.text_area("Escalation plan / clinician notified")
+        acknowledgement = st.text_input("Read-back / acknowledgement notes")
+        save_handover = st.form_submit_button("Save patient handover")
+    if save_handover:
+        if not situation.strip() or not handover_time.strip():
+            st.error("Situation and handover time are required.")
+        else:
+            with connect() as conn:
+                conn.execute("""INSERT INTO patient_handovers
+                    (patient_id, handover_date, handover_time, outgoing_nurse, incoming_nurse, situation, background,
+                     assessment, recommendation, pending_tasks, escalation_plan, acknowledgement, created_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, handover_date.isoformat(), handover_time.strip(), outgoing.strip(), incoming.strip(), situation.strip(),
+                     background.strip(), assessment.strip(), recommendation.strip(), pending_tasks.strip(), escalation_plan.strip(),
+                     acknowledgement.strip(), timestamp_utc()))
+            st.success("Patient handover saved.")
+    with connect() as conn:
+        rows = conn.execute("SELECT id, handover_date, handover_time, outgoing_nurse, incoming_nurse, situation, recommendation, pending_tasks FROM patient_handovers WHERE patient_id=? ORDER BY id DESC LIMIT 20", (pid,)).fetchall()
+    st.markdown("**Recent patient handovers**")
+    st.dataframe(pd.DataFrame(rows, columns=["ID", "Date", "Time", "Outgoing nurse", "Incoming nurse", "Situation", "Recommendation", "Pending tasks"]), use_container_width=True, hide_index=True) if rows else st.info("No patient handovers saved yet.")
+
+with equipment_tab:
+    st.markdown("#### Equipment condition and handover checklist")
+    with st.form("equipment_handover_form"):
+        c1, c2, c3 = st.columns(3)
+        equipment_date = c1.date_input("Handover date", value=day, key="equipment_date")
+        equipment_time = c2.text_input("Handover time (HH:MM)", value="07:00", key="equipment_time")
+        equipment_type = c3.selectbox("Equipment *", ["Incubator / radiant warmer", "Patient monitor", "CPAP system", "Ventilator", "Oxygen delivery", "Suction", "Infusion pump", "Syringe pump", "Phototherapy unit", "Other"])
+        c4, c5, c6 = st.columns(3)
+        equipment_id = c4.text_input("Asset / equipment ID")
+        condition_status = c5.selectbox("Overall status", ["Checked - no issue noted", "Issue identified", "Out of service", "Not checked"])
+        outgoing_staff = c6.text_input("Outgoing staff")
+        incoming_staff = st.text_input("Incoming staff")
+        function_check = st.selectbox("Function check", ["Not documented", "Passed per local checklist", "Failed / issue found", "Not applicable"])
+        alarm_check = st.selectbox("Alarm check", ["Not documented", "Checked per local checklist", "Issue found", "Not applicable"])
+        power_gas_check = st.selectbox("Power / gas / connections", ["Not documented", "Checked per local checklist", "Issue found", "Not applicable"])
+        consumables_check = st.selectbox("Consumables / accessories", ["Not documented", "Available and checked", "Missing / needs replacement", "Not applicable"])
+        fault_or_issue = st.text_area("Faults, damage or outstanding issues")
+        action_taken = st.text_area("Action taken / person notified / equipment isolated if needed")
+        equipment_notes = st.text_area("Additional handover notes")
+        save_equipment = st.form_submit_button("Save equipment handover")
+    if save_equipment:
+        if not equipment_time.strip():
+            st.error("Equipment handover time is required.")
+        elif condition_status in ["Issue identified", "Out of service"] and not fault_or_issue.strip():
+            st.error("Describe the issue or reason for taking the equipment out of service.")
+        else:
+            with connect() as conn:
+                conn.execute("""INSERT INTO equipment_handovers
+                    (patient_id, handover_date, handover_time, equipment_type, equipment_id, condition_status,
+                     function_check, alarm_check, power_gas_check, consumables_check, fault_or_issue, action_taken,
+                     outgoing_staff, incoming_staff, notes, created_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, equipment_date.isoformat(), equipment_time.strip(), equipment_type, equipment_id.strip(), condition_status,
+                     function_check, alarm_check, power_gas_check, consumables_check, fault_or_issue.strip(), action_taken.strip(),
+                     outgoing_staff.strip(), incoming_staff.strip(), equipment_notes.strip(), timestamp_utc()))
+            st.success("Equipment handover saved. Follow local biomedical/equipment safety procedures for faults.")
+    with connect() as conn:
+        rows = conn.execute("SELECT id, handover_date, handover_time, equipment_type, equipment_id, condition_status, function_check, alarm_check, fault_or_issue FROM equipment_handovers WHERE patient_id=? ORDER BY id DESC LIMIT 30", (pid,)).fetchall()
+    st.markdown("**Recent equipment handovers**")
+    st.dataframe(pd.DataFrame(rows, columns=["ID", "Date", "Time", "Equipment", "Asset ID", "Status", "Function check", "Alarm check", "Fault / issue"]), use_container_width=True, hide_index=True) if rows else st.info("No equipment handovers saved yet.")
+
+
 with st.expander("Dates with saved records"):
     with connect() as conn:
         saved_dates = conn.execute(
             """
             SELECT monitor_date FROM daily_observations WHERE patient_id = ?
-            UNION
-            SELECT monitor_date FROM daily_fluids WHERE patient_id = ?
-            ORDER BY monitor_date DESC
+            UNION SELECT monitor_date FROM daily_fluids WHERE patient_id = ?
+            UNION SELECT admission_date FROM nicu_admissions WHERE patient_id = ?
+            UNION SELECT record_date FROM medication_administration WHERE patient_id = ?
+            UNION SELECT assessment_date FROM head_to_toe_assessments WHERE patient_id = ?
+            UNION SELECT handover_date FROM patient_handovers WHERE patient_id = ?
+            UNION SELECT handover_date FROM equipment_handovers WHERE patient_id = ?
+            ORDER BY 1 DESC
             """,
-            (pid, pid),
+            (pid, pid, pid, pid, pid, pid, pid),
         ).fetchall()
     st.write(", ".join(row[0] for row in saved_dates) if saved_dates else "No saved dates yet.")
 
@@ -554,6 +829,9 @@ with st.expander("About this educational prototype"):
         """
         - Select a fictional patient and monitoring date.
         - Vital-sign and fluid records are filtered by patient and date.
+        - Additional modules record admission, medication administration, head-to-toe assessments,
+          patient SBAR handovers, and equipment checks.
+        - Medication doses are entered as prescribed; the app does not calculate or recommend doses.
         - Fluid calculations are arithmetic summaries, not treatment guidance.
         - The database is local SQLite storage and may be reset by the hosting platform.
         - This public demo has no login or access controls. Never enter real patient data.
