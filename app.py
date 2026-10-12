@@ -7,7 +7,12 @@ DB = "today_nurse_demo.db"
 PATIENTS = {
     "DEMO-001": {"name": "Baby A (fictional)", "gestation": "32 weeks", "weight_g": 1650},
     "DEMO-002": {"name": "Baby B (fictional)", "gestation": "35 weeks", "weight_g": 2200},
-}
+} if not patients:
+    st.warning(
+        "No patients are registered yet. "
+        "Please add a patient before recording measurements."
+    )
+    st.stop()
 st.set_page_config(page_title="Today Nurse | Daily NICU Monitoring", page_icon="🩺", layout="wide")
 
 def connect():
@@ -104,12 +109,7 @@ with st.sidebar:
     patient = PATIENTS[pid]
     day = st.date_input("Monitoring sheet date", value=date.today())
     st.caption("Select the date once. Entries below are linked to this patient and date.")
-if not patients:
-    st.warning(
-        "No patients are registered yet. "
-        "Please add a patient before recording measurements."
-    )
-    st.stop()
+
 # LESSON 8: Live dashboard summary cards
 
 with connect() as c:
