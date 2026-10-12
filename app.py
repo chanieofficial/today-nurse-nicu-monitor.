@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, datetime, timezone
 import streamlit as st
 import pandas as pd
-
+import math
 DB = "today_nurse_demo.db"
 PATIENTS = {
     "DEMO-001": {"name": "Baby A (fictional)", "gestation": "32 weeks", "weight_g": 1650},
@@ -39,18 +39,52 @@ def add_observation(pid, day, t, hr, rr, temp, spo2, fio2, support, note):
         (pid, day.isoformat(), timestamp(), t.strftime("%H:%M"), hr, rr, temp, spo2, fio2, support, note))
 
 def add_fluids(pid, day, iv, feeds, meds, other_in, urine, stools, other_out, hours, weight_g):
+
+    # LESSON 9: Input validation
+    numeric_inputs = {
+        "IV fluids": iv,
+        "Feeds": feeds,
+        "Medication fluids": meds,
+        "Other intake": other_in,
+        "Urine": urine,
+        "Stool count": stools,
+        "Other output": other_out,
+        "Monitoring hours": hours,
+        "Weight": weight_g,
+    }
+
+    for label, value in numeric_inputs.items():
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"{label} must be numeric.")
+        if not math.isfinite(value):
+            raise ValueError(f"{label} must be a finite number.")
+
+    if any(value < 0 for value in [
+        iv, feeds, meds, other_in, urine, stools, other_out
+    ]):
+        raise ValueError(
+            "Fluid volumes and stool count cannot be negative."
+        )
+
+    if not float(stools).is_integer():
+        raise ValueError("Stool count must be a whole number.")
+
+    if hours <= 0:
+        raise ValueError(
+            "Monitoring hours must be greater than zero."
+        )
+
+    if weight_g <= 0:
+        raise ValueError("Weight must be greater than zero.")
+
+    # Existing calculations: keep these
     total_in = iv + feeds + meds + other_in
     total_out = urine + other_out
     net = total_in - total_out
     urine_rate = urine / (weight_g / 1000) / hours
-    with connect() as c:
-        c.execute("""INSERT INTO daily_fluids
-        (patient_id, monitor_date, saved_utc, iv_ml, feeds_ml, meds_ml, other_in_ml,
-        urine_ml, stool_count, other_out_ml, hours, total_in, total_out, net_ml, urine_ml_kg_hr)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (pid, day.isoformat(), timestamp(), iv, feeds, meds, other_in, urine, stools,
-         other_out, hours, total_in, total_out, net, urine_rate))
-    return total_in, total_out, net, urine_rate
+
+    # Keep your existing database INSERT and return statement here.
+
 
 init_db()
 st.title("🩺 Today Nurse")
