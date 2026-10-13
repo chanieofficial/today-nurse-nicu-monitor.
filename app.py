@@ -1,97 +1,87 @@
+"""Today Nurse NICU Documentation System v3.0
+Educational prototype, not a validated EHR.
+Do not store identifiable patient data until institutional security, privacy,
+clinical governance, disaster recovery, and validation requirements are met.
 """
-Today Nurse NICU Documentation System
-Blank, linked documentation forms for a neonatal unit.
+from __future__ import annotations
 
-Prototype only; not a validated EHR. Do not use identifiable patient data
-until authentication, authorization, encryption, audit logging, backups,
-retention controls, and clinical governance have been implemented and approved.
-"""
-
+import hashlib
+import hmac
 import json
 import math
+import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "2.0"
-DB_PATH = Path(__file__).with_name("today_nurse_nicu.db")
+APP_VERSION = "3.0.0"
+APP_TITLE = "Today Nurse | NICU Documentation"
+DB_PATH = Path(os.environ.get("TODAY_NURSE_DB_PATH", str(Path(__file__).with_name("today_nurse_nicu.db"))))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(
-    page_title="Today Nurse | NICU Documentation",
-    page_icon="🩺",
-    layout="wide",
-)
+st.set_page_config(page_title=APP_TITLE, page_icon="🩺", layout="wide", initial_sidebar_state="expanded")
 
-# ---------------------------------------------------------------------------
-# Utilities and persistence
-# ---------------------------------------------------------------------------
-
-def utc_now():
+# ---------- Core utilities ----------
+def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def validate_measurement(
-    label: str,
-    value: float | int | None,
-    minimum: float,
-    maximum: float,
-    *,
-    allow_zero: bool = True,
-) -> float | None:
-    """Validate a measured numeric value. Never infer missing data."""
+def clean(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return value
 
+
+def valid_number(label: str, value: Any, low: float, high: float, *, required: bool = False) -> float | None:
+    if value is None:
+        if required:
+            raise ValueError(f"{label} is required.")
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label}: enter a valid numeric value.") from exc
-
-    if not math.isfinite(number):
-        raise ValueError(f"{label}: value must be finite.")
-
-    if number < minimum or number > maximum:
-        raise ValueError(
-            f"{label}: value must be between {minimum} and {maximum}."
-        )
-
-    if not allow_zero and number == 0:
-        raise ValueError(f"{label}: value must be greater than zero.")
-
+        raise ValueError(f"{label} must be numeric.") from exc
+    if not math.isfinite(number) or not low <= number <= high:
+        raise ValueError(f"{label} must be between {low:g} and {high:g}.")
     return number
 
 
-def validate_staff_name(name: str) -> str:
-    """Require a non-empty staff identifier."""
-    cleaned = name.strip()
-    if not cleaned:
+def staff_required(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
         raise ValueError("Staff name or staff ID is required.")
-    return cleaned
+    return name
 
 
-def validate_time_order(start, end) -> float:
-    """Validate same-day intervals; overnight intervals need explicit dates."""
-    start_minutes = start.hour * 60 + start.minute
-    end_minutes = end.hour * 60 + end.minute
+def interval_datetimes(record_date: date, start: time, end: time) -> tuple[datetime, datetime, float]:
+    """A same-day end earlier than start is treated as next-day; equal times are rejected."""
+    start_dt = datetime.combine(record_date, start.replace(second=0, microsecond=0))
+    end_dt = datetime.combine(record_date, end.replace(second=0, microsecond=0))
+    if end_dt == start_dt:
+        raise ValueError("Interval start and end cannot be identical.")
+    if end_dt < start_dt:
+        end_dt += timedelta(days=1)
+    hours = (end_dt - start_dt).total_seconds() / 3600
+    if not 0 < hours <= 48:
+        raise ValueError("Interval duration must be greater than zero and no more than 48 hours.")
+    return start_dt, end_dt, hours
 
-    if end_minutes <= start_minutes:
-        raise ValueError(
-            "The end time must be later than the start time. "
-            "Overnight intervals need an explicit end date."
-        )
-
-    return (end_minutes - start_minutes) / 60.0
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()
@@ -102,1091 +92,600 @@ def db():
         conn.close()
 
 
-def columns_for(conn, table):
-    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+def columns_for(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
 
 
-def ensure_column(conn, table, name, sql_type):
+def ensure_column(conn: sqlite3.Connection, table: str, name: str, typ: str) -> None:
+    # table/name/type are internal constants only, never user input.
     if name not in columns_for(conn, table):
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {typ}')
 
 
-def init_db():
+def init_db() -> None:
     with db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS patients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hospital_patient_id TEXT NOT NULL UNIQUE,
-            patient_label TEXT NOT NULL,
-            date_of_birth TEXT,
-            sex TEXT,
-            residential_address TEXT,
-            guardian_name TEXT,
-            guardian_relationship TEXT,
-            primary_contact_phone TEXT,
-            alternate_contact_phone TEXT,
-            contact_email TEXT,
-            created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, hospital_patient_id TEXT NOT NULL UNIQUE,
+          patient_label TEXT NOT NULL, date_of_birth TEXT, sex TEXT,
+          residential_address TEXT, guardian_name TEXT, guardian_relationship TEXT,
+          primary_contact_phone TEXT, alternate_contact_phone TEXT, contact_email TEXT,
+          created_utc TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS admissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER NOT NULL REFERENCES patients(id),
-            admission_date TEXT NOT NULL,
-            admission_time TEXT NOT NULL,
-            gestational_age_weeks REAL,
-            gestational_age_days INTEGER,
-            birth_weight_g REAL,
-            admission_weight_g REAL,
-            delivery_mode TEXT,
-            apgar_1 TEXT,
-            apgar_5 TEXT,
-            referring_facility TEXT,
-            admission_reason TEXT NOT NULL,
-            maternal_perinatal_history TEXT,
-            resuscitation TEXT,
-            initial_condition TEXT,
-            respiratory_support TEXT,
-            oxygen_or_support_settings TEXT,
-            lines_devices TEXT,
-            allergies TEXT,
-            infection_risk TEXT,
-            initial_nursing_assessment TEXT,
-            nursing_priorities TEXT,
-            admitting_clinician TEXT,
-            admitting_nurse TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Active',
-            admission_record_json TEXT,
-            created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, patient_id INTEGER NOT NULL REFERENCES patients(id),
+          admission_date TEXT NOT NULL, admission_time TEXT NOT NULL,
+          gestational_age_weeks INTEGER, gestational_age_days INTEGER,
+          birth_weight_g REAL, admission_weight_g REAL, delivery_mode TEXT,
+          apgar_1 TEXT, apgar_5 TEXT, referring_facility TEXT, admission_reason TEXT NOT NULL,
+          maternal_perinatal_history TEXT, resuscitation TEXT, initial_condition TEXT,
+          respiratory_support TEXT, oxygen_or_support_settings TEXT, lines_devices TEXT,
+          allergies TEXT, infection_risk TEXT, initial_nursing_assessment TEXT,
+          nursing_priorities TEXT, admitting_clinician TEXT, admitting_nurse TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'Active', discharge_date TEXT, discharge_time TEXT,
+          discharge_summary TEXT, admission_record_json TEXT, created_utc TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            observation_date TEXT NOT NULL,
-            observation_time TEXT NOT NULL,
-            heart_rate REAL, respiratory_rate REAL, temperature_c REAL,
-            spo2_percent REAL, fio2_percent REAL, blood_pressure TEXT,
-            pain_score TEXT, respiratory_support TEXT, support_settings TEXT,
-            capillary_refill TEXT, nurse_name TEXT NOT NULL, note TEXT,
-            created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          observation_date TEXT NOT NULL, observation_time TEXT NOT NULL,
+          heart_rate REAL, respiratory_rate REAL, temperature_c REAL, spo2_percent REAL,
+          fio2_percent REAL, blood_pressure TEXT, pain_score TEXT, respiratory_support TEXT,
+          support_settings TEXT, capillary_refill TEXT, nurse_name TEXT NOT NULL, note TEXT,
+          created_utc TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS fluid_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            record_date TEXT NOT NULL,
-            interval_start TEXT NOT NULL, interval_end TEXT NOT NULL,
-            weight_g REAL NOT NULL,
-            iv_ml REAL NOT NULL DEFAULT 0, feeds_ml REAL NOT NULL DEFAULT 0,
-            medication_ml REAL NOT NULL DEFAULT 0, blood_products_ml REAL NOT NULL DEFAULT 0,
-            other_intake_ml REAL NOT NULL DEFAULT 0, urine_ml REAL NOT NULL DEFAULT 0,
-            stool_count INTEGER NOT NULL DEFAULT 0, emesis_ml REAL NOT NULL DEFAULT 0,
-            drains_ml REAL NOT NULL DEFAULT 0, other_output_ml REAL NOT NULL DEFAULT 0,
-            total_intake_ml REAL NOT NULL, total_output_ml REAL NOT NULL,
-            net_balance_ml REAL NOT NULL, urine_output_ml_kg_hr REAL,
-            nurse_name TEXT NOT NULL, notes TEXT, created_utc TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS medication_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            record_date TEXT NOT NULL, medication_name TEXT NOT NULL,
-            prescribed_dose TEXT NOT NULL, route TEXT NOT NULL, frequency TEXT,
-            scheduled_time TEXT, status TEXT NOT NULL, actual_administration_time TEXT,
-            weight_used_g REAL, allergy_check TEXT NOT NULL, double_check TEXT,
-            nurse_name TEXT NOT NULL, indication TEXT,
-            withheld_or_omitted_reason TEXT, response_or_notes TEXT, created_utc TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS assessments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            assessment_date TEXT NOT NULL, assessment_time TEXT NOT NULL,
-            assessment_type TEXT NOT NULL, gestational_age_context TEXT,
-            neurological TEXT, respiratory TEXT, cardiovascular TEXT,
-            thermoregulation_skin TEXT, gastrointestinal_feeding TEXT,
-            genitourinary TEXT, musculoskeletal TEXT, pain_comfort TEXT,
-            lines_tubes_devices TEXT, infection_risk TEXT,
-            developmental_family_care TEXT, findings_interventions TEXT,
-            escalation_actions TEXT, nurse_name TEXT NOT NULL, created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          assessment_date TEXT NOT NULL, assessment_time TEXT NOT NULL, assessment_type TEXT NOT NULL,
+          neurological TEXT, respiratory TEXT, cardiovascular TEXT, thermoregulation_skin TEXT,
+          gastrointestinal_feeding TEXT, genitourinary TEXT, musculoskeletal TEXT, pain_comfort TEXT,
+          lines_tubes_devices TEXT, infection_risk TEXT, developmental_family_care TEXT,
+          findings_interventions TEXT, escalation_actions TEXT, nurse_name TEXT NOT NULL, created_utc TEXT NOT NULL
         );
-
+        CREATE TABLE IF NOT EXISTS fluid_records (
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          record_date TEXT NOT NULL, interval_start TEXT NOT NULL, interval_end TEXT NOT NULL,
+          interval_start_utc TEXT, interval_end_utc TEXT, duration_hours REAL,
+          weight_g REAL NOT NULL, iv_ml REAL NOT NULL, feeds_ml REAL NOT NULL,
+          medication_ml REAL NOT NULL, blood_products_ml REAL NOT NULL, other_intake_ml REAL NOT NULL,
+          urine_ml REAL NOT NULL, stool_count INTEGER NOT NULL, emesis_ml REAL NOT NULL,
+          drains_ml REAL NOT NULL, other_output_ml REAL NOT NULL, total_intake_ml REAL NOT NULL,
+          total_output_ml REAL NOT NULL, net_balance_ml REAL NOT NULL, urine_output_ml_kg_hr REAL NOT NULL,
+          nurse_name TEXT NOT NULL, notes TEXT, created_utc TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS medication_records (
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          record_date TEXT NOT NULL, medication_name TEXT NOT NULL, prescribed_dose TEXT NOT NULL,
+          route TEXT NOT NULL, frequency TEXT, scheduled_time TEXT, status TEXT NOT NULL,
+          actual_administration_time TEXT, weight_used_g REAL, allergy_check TEXT NOT NULL,
+          double_check TEXT, nurse_name TEXT NOT NULL, indication TEXT,
+          withheld_or_omitted_reason TEXT, response_or_notes TEXT, created_utc TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS equipment_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            check_date TEXT NOT NULL, check_time TEXT NOT NULL,
-            equipment_type TEXT NOT NULL, equipment_identifier TEXT,
-            assigned_patient_confirmed TEXT NOT NULL, physical_condition TEXT NOT NULL,
-            function_check TEXT NOT NULL, alarm_check TEXT, power_gas_check TEXT,
-            consumables_check TEXT, cleaning_status TEXT, fault_or_issue TEXT,
-            action_taken TEXT, escalation_or_ticket TEXT, outgoing_staff TEXT,
-            incoming_staff TEXT, nurse_name TEXT NOT NULL, notes TEXT, created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          check_date TEXT NOT NULL, check_time TEXT NOT NULL, equipment_type TEXT NOT NULL,
+          equipment_identifier TEXT, assigned_patient_confirmed TEXT NOT NULL,
+          physical_condition TEXT NOT NULL, function_check TEXT NOT NULL, alarm_check TEXT,
+          power_gas_check TEXT, consumables_check TEXT, cleaning_status TEXT, fault_or_issue TEXT,
+          action_taken TEXT, escalation_or_ticket TEXT, outgoing_staff TEXT, incoming_staff TEXT,
+          nurse_name TEXT NOT NULL, notes TEXT, created_utc TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS handovers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            handover_date TEXT NOT NULL, handover_time TEXT NOT NULL,
-            shift TEXT NOT NULL, outgoing_nurse TEXT NOT NULL, incoming_nurse TEXT NOT NULL,
-            situation TEXT NOT NULL, background TEXT, assessment_summary TEXT,
-            recommendations TEXT, airway_respiratory TEXT, fluids_feeding_elimination TEXT,
-            medication_due_or_pending TEXT, lines_devices_equipment TEXT,
-            investigations_pending TEXT, safety_concerns TEXT, escalation_plan TEXT,
-            acknowledgement TEXT, created_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          handover_date TEXT NOT NULL, handover_time TEXT NOT NULL, shift TEXT NOT NULL,
+          outgoing_nurse TEXT NOT NULL, incoming_nurse TEXT NOT NULL, situation TEXT NOT NULL,
+          background TEXT, assessment_summary TEXT, recommendations TEXT, airway_respiratory TEXT,
+          fluids_feeding_elimination TEXT, medication_due_or_pending TEXT, lines_devices_equipment TEXT,
+          investigations_pending TEXT, safety_concerns TEXT, escalation_plan TEXT, acknowledgement TEXT,
+          created_utc TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS progress_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            note_date TEXT NOT NULL, note_time TEXT NOT NULL, note_type TEXT NOT NULL,
-            assessment TEXT, nursing_intervention TEXT, response_evaluation TEXT,
-            communication_escalation TEXT, nurse_name TEXT NOT NULL, created_utc TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS nursing_care_plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admission_id INTEGER NOT NULL REFERENCES admissions(id),
-            plan_date TEXT NOT NULL, review_date TEXT,
-            priority TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Active',
-            problem_or_diagnosis TEXT NOT NULL, assessment_cues TEXT,
-            goals_outcomes TEXT NOT NULL, interventions TEXT NOT NULL,
-            frequency_or_schedule TEXT, implementation_notes TEXT,
-            evaluation TEXT, evaluation_status TEXT NOT NULL DEFAULT 'Ongoing',
-            escalation_or_communication TEXT, nurse_name TEXT NOT NULL,
-            reviewer_name TEXT, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          plan_date TEXT NOT NULL, review_date TEXT, priority TEXT NOT NULL, status TEXT NOT NULL,
+          problem_or_diagnosis TEXT NOT NULL, assessment_cues TEXT, goals_outcomes TEXT NOT NULL,
+          interventions TEXT NOT NULL, frequency_or_schedule TEXT, implementation_notes TEXT,
+          evaluation TEXT, evaluation_status TEXT NOT NULL, escalation_or_communication TEXT,
+          nurse_name TEXT NOT NULL, reviewer_name TEXT, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS progress_notes (
+          id INTEGER PRIMARY KEY, admission_id INTEGER NOT NULL REFERENCES admissions(id),
+          note_date TEXT NOT NULL, note_time TEXT NOT NULL, note_type TEXT NOT NULL,
+          assessment TEXT, nursing_intervention TEXT, response_evaluation TEXT,
+          communication_escalation TEXT, nurse_name TEXT NOT NULL, created_utc TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_events (
+          id INTEGER PRIMARY KEY, event_utc TEXT NOT NULL, actor TEXT NOT NULL,
+          action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER,
+          detail TEXT, previous_hash TEXT, event_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_admissions_patient_status ON admissions(patient_id,status);
+        CREATE INDEX IF NOT EXISTS idx_obs_admission_date ON observations(admission_id,observation_date,observation_time);
+        CREATE INDEX IF NOT EXISTS idx_fluid_admission_date ON fluid_records(admission_id,record_date);
+        CREATE INDEX IF NOT EXISTS idx_notes_admission_date ON progress_notes(admission_id,note_date,note_time);
         """)
-
-        # Migrations for databases made by earlier app versions.
-        patient_additions = {
-            "residential_address": "TEXT", "guardian_name": "TEXT",
-            "guardian_relationship": "TEXT", "primary_contact_phone": "TEXT",
-            "alternate_contact_phone": "TEXT", "contact_email": "TEXT",
+        # Backwards-compatible schema upgrades for v2 databases.
+        upgrades = {
+          "patients": {"residential_address":"TEXT", "guardian_name":"TEXT", "guardian_relationship":"TEXT", "primary_contact_phone":"TEXT", "alternate_contact_phone":"TEXT", "contact_email":"TEXT"},
+          "admissions": {"status":"TEXT NOT NULL DEFAULT 'Active'", "discharge_date":"TEXT", "discharge_time":"TEXT", "discharge_summary":"TEXT", "admission_record_json":"TEXT"},
+          "fluid_records": {"interval_start_utc":"TEXT", "interval_end_utc":"TEXT", "duration_hours":"REAL"},
         }
-        for name, typ in patient_additions.items():
-            ensure_column(conn, "patients", name, typ)
-        ensure_column(conn, "admissions", "admission_record_json", "TEXT")
-        ensure_column(conn, "admissions", "status", "TEXT NOT NULL DEFAULT 'Active'")
+        for table, additions in upgrades.items():
+            for name, typ in additions.items():
+                ensure_column(conn, table, name, typ)
 
 
-init_db()
+def audit(actor: str, action: str, entity_type: str, entity_id: int | None = None, detail: str | None = None) -> None:
+    actor = (actor or "unidentified").strip()[:120]
+    with db() as conn:
+        previous = conn.execute("SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        previous_hash = previous["event_hash"] if previous else "GENESIS"
+        event = {"event_utc": utc_now(), "actor": actor, "action": action,
+                 "entity_type": entity_type, "entity_id": entity_id, "detail": detail,
+                 "previous_hash": previous_hash}
+        canonical = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        event_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        conn.execute("INSERT INTO audit_events(event_utc,actor,action,entity_type,entity_id,detail,previous_hash,event_hash) VALUES(?,?,?,?,?,?,?,?)",
+                     (event["event_utc"], actor, action, entity_type, entity_id, detail, previous_hash, event_hash))
 
 
-def fetchall(sql, params=()):
+def rows(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     with db() as conn:
         return conn.execute(sql, params).fetchall()
 
 
-def save(sql, params):
+def insert(sql: str, params: tuple, actor: str, entity: str, detail: str | None = None) -> int:
     with db() as conn:
         cur = conn.execute(sql, params)
-        return cur.lastrowid
+        entity_id = int(cur.lastrowid)
+    audit(actor, "CREATE", entity, entity_id, detail)
+    return entity_id
 
 
-def as_optional(value):
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value.strip() or None
-    return value
+def csv_export(records: list[sqlite3.Row], filename: str, key: str) -> None:
+    if not records:
+        st.info("No records available.")
+        return
+    frame = pd.DataFrame([dict(r) for r in records])
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+    st.download_button("Export CSV", frame.to_csv(index=False).encode("utf-8-sig"), filename, "text/csv", key=key)
 
 
-def export_table(rows, filename, key):
-    if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Export CSV",
-            df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=filename,
-            mime="text/csv",
-            key=key,
-        )
-    else:
-        st.info("No records have been saved for this admission.")
-
-
-def show_datetime_inputs(prefix, selected_date):
-    a, b = st.columns(2)
-    with a:
-        d = st.date_input("Date", value=selected_date, key=f"{prefix}_date")
-    with b:
-        t = st.time_input(
-            "Time",
-            value=datetime.now().time().replace(second=0, microsecond=0),
-            key=f"{prefix}_time",
-        )
+def date_time_fields(prefix: str, default_date: date) -> tuple[date, time]:
+    c1, c2 = st.columns(2)
+    with c1:
+        d = st.date_input("Record date", value=default_date, key=f"{prefix}_date")
+    with c2:
+        t = st.time_input("Record time", value=datetime.now().time().replace(second=0, microsecond=0), key=f"{prefix}_time")
     return d, t
 
 
-# ---------------------------------------------------------------------------
-# App header and safety notice
-# ---------------------------------------------------------------------------
+def notify_error(fn):
+    try:
+        fn()
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        st.error(str(exc))
+    except sqlite3.Error:
+        st.error("The record could not be saved. Check server logs; do not repeatedly resubmit until the result is confirmed.")
+
+
+# ---------- Access gate ----------
+def authenticate() -> str | None:
+    """Optional local gate. Configure [auth] users in Streamlit secrets with SHA-256 password hashes.
+    This is a minimal prototype gate, not a substitute for SSO/MFA or production identity management.
+    """
+    try:
+        users = dict(st.secrets.get("auth", {}).get("users", {}))
+    except Exception:
+        users = {}
+    if not users:
+        st.session_state["actor"] = "DEMO USER"
+        st.warning("DEMO MODE: authentication is not configured. Use fictional data only. Public deployment is not suitable for patient records.")
+        return "DEMO USER"
+    if st.session_state.get("actor") in users:
+        return st.session_state["actor"]
+    st.title("🩺 Today Nurse NICU Documentation")
+    st.caption("Sign in with an authorized staff account.")
+    with st.form("login_form"):
+        username = st.text_input("Staff username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Sign in")
+    if submit:
+        stored = str(users.get(username, ""))
+        supplied = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        if stored and hmac.compare_digest(stored, supplied):
+            st.session_state["actor"] = username
+            st.rerun()
+        st.error("Invalid credentials.")
+    st.info("Configure user password hashes in Streamlit secrets before use. Use a managed identity provider and MFA for production.")
+    return None
+
+
+init_db()
+actor = authenticate()
+if actor is None:
+    st.stop()
 
 st.title("🩺 Today Nurse | NICU Nursing Documentation")
-st.caption(f"Version {APP_VERSION} · Linked documentation forms · SQLite storage")
-st.warning(
-    "SECURITY NOTICE: This prototype does not provide user authentication, role-based "
-    "access, audit-grade record locking, or encrypted clinical storage. Do not enter "
-    "identifiable patient information until deployed in an approved, secured environment. "
-    "Validate workflows against hospital policies before clinical use."
-)
+st.caption(f"Version {APP_VERSION} · Linked clinical documentation · SQLite prototype")
+st.warning("PROTOTYPE SAFETY NOTICE: SQLite file storage is not guaranteed durable on ephemeral hosting. No encryption at rest, institutional identity provider, MFA, formal access controls, verified backup/restore, or clinical validation is provided by this app. Use fictional data only until approved and secured.")
 
-# ---------------------------------------------------------------------------
-# Sidebar: admission selection
-# ---------------------------------------------------------------------------
-
+# ---------- Sidebar / active episode ----------
 with st.sidebar:
     st.header("Patient / admission")
-    active_rows = fetchall("""
-        SELECT a.id, p.hospital_patient_id, p.patient_label, a.admission_date,
-               a.admission_reason, a.status
-        FROM admissions a JOIN patients p ON p.id=a.patient_id
-        WHERE a.status='Active'
-        ORDER BY a.admission_date DESC, a.id DESC
-    """)
-    admission_labels = {
-        f"{r['hospital_patient_id']} | {r['patient_label']} | episode #{r['id']} | {r['admission_date']}": r["id"]
-        for r in active_rows
-    }
-    if admission_labels:
-        selected_label = st.selectbox("Active admission", list(admission_labels))
-        admission_id = admission_labels[selected_label]
-        st.caption("Clinical forms are linked to this admission episode.")
-    else:
-        admission_id = None
-        st.info("No active admission. Register a patient and create an admission first.")
-    view_date = st.date_input("Default record date", value=date.today(), key="global_record_date")
+    active = rows("""SELECT a.id,p.hospital_patient_id,p.patient_label,a.admission_date,a.admission_reason,a.status
+                    FROM admissions a JOIN patients p ON p.id=a.patient_id WHERE a.status='Active'
+                    ORDER BY a.admission_date DESC,a.id DESC""")
+    label_map = {f"{r['hospital_patient_id']} · {r['patient_label']} · Episode #{r['id']} · {r['admission_date']}": r['id'] for r in active}
+    selected_label = st.selectbox("Active admission", list(label_map), index=0) if label_map else None
+    admission_id = label_map.get(selected_label) if selected_label else None
+    default_date = st.date_input("Default record date", value=date.today(), key="global_record_date")
     st.divider()
-    st.caption("Today Nurse · NICU Documentation")
+    st.caption(f"Signed in: {actor}")
+    if st.button("Log out"):
+        st.session_state.pop("actor", None)
+        st.rerun()
 
-# ---------------------------------------------------------------------------
-# Workflow tabs
-# ---------------------------------------------------------------------------
+# ---------- Navigation: indices intentionally match all sections ----------
+sections = st.tabs(["Dashboard", "Patient registry", "Initial admission", "Head-to-toe assessment", "Vital signs", "Fluid balance", "Medication record", "Equipment checks", "Shift handover", "Nursing care plan", "Progress notes & history"])
 
-
-sections = st.tabs([
-    "Dashboard",
-    "1 · Patient registry",
-    "2 · Initial admission",
-    "3 · Head-to-toe assessment",
-    "4 · Vital signs",
-    "5 · Fluid balance",
-    "6 · Medication record",
-    "7 · Equipment checks",
-    "8 · Shift handover",
-    "9 · Nursing care plan",
-    "10 · Progress notes & history",
-])
-
-
-# 1. Patient registry
+# 0 Dashboard
 with sections[0]:
-    st.subheader("Patient registry")
-    st.caption("Use the hospital-assigned MRN and follow local privacy and identification policies.")
-    with st.form("patient_registration", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            mrn = st.text_input("Medical Record Number (MRN) *")
-            patient_label = st.text_input("Newborn name / approved patient label *")
-            dob = st.date_input("Date of birth (optional)", value=None, min_value=date(1990, 1, 1), max_value=date.today())
-            sex = st.selectbox("Sex", ["Not recorded", "Female", "Male", "Indeterminate / not yet assigned", "Other / per policy"])
-            address = st.text_area("Parent/guardian residential address")
-        with c2:
-            guardian = st.text_input("Parent/guardian full name")
-            relationship = st.selectbox("Relationship", ["Not recorded", "Mother", "Father", "Legal guardian", "Other"])
-            phone = st.text_input("Primary contact phone")
-            alternate_phone = st.text_input("Alternate contact phone")
-            email = st.text_input("Contact email (optional)")
-        register = st.form_submit_button("Register patient")
-    if register:
-        if not mrn.strip() or not patient_label.strip():
-            st.error("MRN and patient label are required.")
-        elif email.strip() and ("@" not in email or "." not in email.split("@")[-1]):
-            st.error("Enter a valid email address or leave email blank.")
-        else:
-            try:
-                new_patient = save(
-                    """INSERT INTO patients(
-                        hospital_patient_id, patient_label, date_of_birth, sex,
-                        residential_address, guardian_name, guardian_relationship,
-                        primary_contact_phone, alternate_contact_phone, contact_email, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        mrn.strip(), patient_label.strip(), dob.isoformat() if dob else None,
-                        None if sex == "Not recorded" else sex, as_optional(address),
-                        as_optional(guardian), None if relationship == "Not recorded" else relationship,
-                        as_optional(phone), as_optional(alternate_phone), as_optional(email), utc_now(),
-                    ),
-                )
-                st.success(f"Patient registered (internal record #{new_patient}). Create an admission in tab 2.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("That MRN already exists. Select the existing patient rather than creating a duplicate.")
+    patients_count = rows("SELECT COUNT(*) n FROM patients")[0]["n"]
+    active_count = rows("SELECT COUNT(*) n FROM admissions WHERE status='Active'")[0]["n"]
+    obs_count = rows("SELECT COUNT(*) n FROM observations WHERE observation_date=?", (date.today().isoformat(),))[0]["n"]
+    plans_due = rows("SELECT COUNT(*) n FROM nursing_care_plans WHERE status='Active' AND review_date IS NOT NULL AND review_date<=?", (date.today().isoformat(),))[0]["n"]
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Registered patients", patients_count)
+    c2.metric("Active admissions", active_count)
+    c3.metric("Today's observations", obs_count)
+    c4.metric("Care plans due for review", plans_due)
+    st.subheader("Active admissions")
+    dash = rows("""SELECT p.hospital_patient_id AS 'Patient ID',p.patient_label AS Patient,
+                 a.id AS Episode,a.admission_date AS 'Admission date',a.admission_reason AS 'Admission reason',
+                 a.gestational_age_weeks AS 'GA weeks',a.gestational_age_days AS 'GA days',a.status AS Status
+                 FROM admissions a JOIN patients p ON p.id=a.patient_id WHERE a.status='Active'
+                 ORDER BY a.admission_date DESC,a.id DESC""")
+    if dash: st.dataframe(pd.DataFrame([dict(r) for r in dash]), use_container_width=True, hide_index=True)
+    else: st.info("No active admissions. Register a patient, then create an admission.")
+    st.subheader("Recent documentation activity")
+    activity = rows("SELECT event_utc AS UTC,actor AS Staff,action AS Action,entity_type AS Record,entity_id AS 'Record ID',detail AS Details FROM audit_events ORDER BY id DESC LIMIT 20")
+    if activity: st.dataframe(pd.DataFrame([dict(r) for r in activity]), use_container_width=True, hide_index=True)
+    else: st.caption("No audit events yet.")
+    st.caption("Dashboard summaries are operational counts, not clinical decision support. No automated diagnosis or treatment recommendation is generated.")
 
-    patient_rows = fetchall("""
-        SELECT id, hospital_patient_id AS MRN, patient_label AS Patient,
-               date_of_birth AS DOB, sex AS Sex, guardian_name AS Guardian,
-               guardian_relationship AS Relationship, primary_contact_phone AS Phone,
-               alternate_contact_phone AS 'Alternate phone', contact_email AS Email,
-               residential_address AS Address
-        FROM patients ORDER BY patient_label
-    """)
-    if patient_rows:
-        st.markdown("#### Registered patients")
-        export_table(patient_rows, "today_nurse_patients.csv", "export_patients")
-
-
-# 2. Initial admission
+# 1 Patient registry
 with sections[1]:
+    st.subheader("Patient registry")
+    with st.form("patient_registration", clear_on_submit=True):
+        c1,c2 = st.columns(2)
+        with c1:
+            mrn = st.text_input("Hospital Medical Record Number *")
+            patient_label = st.text_input("Approved patient label *")
+            dob = st.date_input("Date of birth (optional)", value=None, min_value=date(1990,1,1), max_value=date.today())
+            sex = st.selectbox("Sex", ["Not recorded","Female","Male","Indeterminate / not yet assigned","Other / per policy"])
+            address = st.text_area("Residential address (optional)")
+        with c2:
+            guardian = st.text_input("Parent / guardian")
+            relationship = st.selectbox("Relationship", ["Not recorded","Mother","Father","Legal guardian","Other"])
+            phone = st.text_input("Primary contact")
+            alt_phone = st.text_input("Alternate contact")
+            email = st.text_input("Email (optional)")
+        submit_patient = st.form_submit_button("Register patient")
+    if submit_patient:
+        def do_patient():
+            if not mrn.strip() or not patient_label.strip(): raise ValueError("Hospital MRN and approved patient label are required.")
+            if dob and dob > date.today(): raise ValueError("Date of birth cannot be in the future.")
+            if email.strip() and ("@" not in email or "." not in email.rsplit("@",1)[-1]): raise ValueError("Enter a valid email or leave it blank.")
+            pid = insert("INSERT INTO patients(hospital_patient_id,patient_label,date_of_birth,sex,residential_address,guardian_name,guardian_relationship,primary_contact_phone,alternate_contact_phone,contact_email,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (mrn.strip(),patient_label.strip(),dob.isoformat() if dob else None,None if sex=="Not recorded" else sex,clean(address),clean(guardian),None if relationship=="Not recorded" else relationship,clean(phone),clean(alt_phone),clean(email),utc_now()),actor,"patient",f"MRN {mrn.strip()}")
+            st.success(f"Patient registered (internal ID {pid}).")
+            st.rerun()
+        notify_error(do_patient)
+    patient_rows = rows("SELECT id,hospital_patient_id AS MRN,patient_label AS Patient,date_of_birth AS DOB,sex AS Sex,guardian_name AS Guardian,guardian_relationship AS Relationship,primary_contact_phone AS Phone,alternate_contact_phone AS 'Alternate phone',contact_email AS Email,residential_address AS Address,created_utc AS 'Created UTC' FROM patients ORDER BY patient_label")
+    csv_export(patient_rows,"today_nurse_patients.csv","export_patients")
+
+# 2 Admission
+with sections[2]:
     st.subheader("Initial NICU admission")
-    patients = fetchall("""
-        SELECT id, hospital_patient_id, patient_label, date_of_birth, sex,
-               residential_address, guardian_name, guardian_relationship,
-               primary_contact_phone, alternate_contact_phone, contact_email
-        FROM patients ORDER BY patient_label
-    """)
-    if not patients:
-        st.info("Register a patient in tab 1 before creating an admission.")
+    patients = rows("SELECT id,hospital_patient_id,patient_label FROM patients ORDER BY patient_label")
+    if not patients: st.info("Register a patient first.")
     else:
-        patient_map = {
-            f"{r['hospital_patient_id']} | {r['patient_label']}": r["id"] for r in patients
-        }
+        pmap = {f"{r['hospital_patient_id']} · {r['patient_label']}":r['id'] for r in patients}
         with st.form("admission_form", clear_on_submit=True):
-            patient_key = st.selectbox("Patient *", list(patient_map))
-            c1, c2, c3 = st.columns(3)
+            pkey = st.selectbox("Patient *",list(pmap))
+            c1,c2,c3 = st.columns(3)
             with c1:
-                adm_date = st.date_input("Admission date", value=view_date, key="adm_date")
-                adm_time = st.time_input("Admission time", value=datetime.now().time().replace(second=0, microsecond=0), key="adm_time")
-                ga_weeks = st.number_input("Gestational age (completed weeks)", min_value=0, max_value=45, value=0)
-                ga_days = st.number_input("Additional gestational days", min_value=0, max_value=6, value=0)
-                birth_weight = st.number_input("Birth weight (g)", min_value=0.0, max_value=10000.0, value=0.0, step=10.0)
-                admission_weight = st.number_input("Admission weight (g)", min_value=0.0, max_value=10000.0, value=0.0, step=10.0)
+                adm_date = st.date_input("Admission date",value=default_date,key="adm_date")
+                adm_time = st.time_input("Admission time",value=datetime.now().time().replace(second=0,microsecond=0),key="adm_time")
+                ga_w = st.number_input("Gestational age, completed weeks",min_value=0,max_value=45,value=0)
+                ga_d = st.number_input("Additional days",min_value=0,max_value=6,value=0)
+                birth_w = st.number_input("Birth weight (g)",min_value=0.0,max_value=10000.0,value=None,step=10.0)
+                adm_w = st.number_input("Admission weight (g)",min_value=0.0,max_value=10000.0,value=None,step=10.0)
             with c2:
-                delivery = st.selectbox("Mode of delivery", ["Not documented", "Spontaneous vaginal", "Assisted vaginal", "Caesarean section", "Other / unknown"])
+                delivery = st.selectbox("Delivery mode",["Not documented","Spontaneous vaginal","Assisted vaginal","Caesarean section","Other / unknown"])
                 apgar1 = st.text_input("Apgar at 1 minute")
                 apgar5 = st.text_input("Apgar at 5 minutes")
-                referring = st.text_input("Referring facility / location")
-                reason = st.text_area("Reason for NICU admission *", height=100)
-                resuscitation = st.text_area("Delivery-room resuscitation / stabilization", height=90)
+                referring = st.text_input("Referring facility")
+                reason = st.text_area("Reason for admission *")
+                resuscitation = st.text_area("Resuscitation / stabilization")
             with c3:
-                initial_condition = st.text_area("Condition on arrival", height=90)
-                maternal_history = st.text_area("Maternal / perinatal history", height=90)
-                support = st.selectbox("Respiratory support", ["Not documented", "Room air", "Low-flow oxygen", "HFNC", "CPAP", "NIPPV", "Mechanical ventilation", "Other"])
-                settings = st.text_area("Oxygen / respiratory support settings", height=70)
-            lines = st.text_area("Lines, tubes and devices")
-            allergies = st.text_area("Known allergies / status")
+                condition = st.text_area("Condition on arrival")
+                maternal = st.text_area("Maternal / perinatal history")
+                support = st.selectbox("Respiratory support",["Not documented","Room air","Low-flow oxygen","HFNC","CPAP","NIPPV","Mechanical ventilation","Other"])
+                settings = st.text_area("Support settings")
+            lines = st.text_area("Lines / tubes / devices")
+            allergies = st.text_area("Allergies / verification status")
             infection = st.text_area("Infection risk / precautions")
-            initial_assessment = st.text_area("Initial nursing assessment")
-            priorities = st.text_area("Initial nursing priorities / plan")
-            extra_record = st.text_area(
-                "Additional neonatal admission record details (optional)",
-                help="You can record other locally required admission fields here. Do not enter unverified information.",
-            )
-            c4, c5 = st.columns(2)
-            with c4:
-                clinician = st.text_input("Admitting clinician")
-            with c5:
-                admitting_nurse = st.text_input("Admitting nurse name / staff ID *")
-            create_admission = st.form_submit_button("Save initial admission")
-        if create_admission:
-            if not reason.strip() or not admitting_nurse.strip():
-                st.error("Admission reason and admitting nurse are required.")
+            assessment = st.text_area("Initial nursing assessment")
+            priorities = st.text_area("Initial nursing priorities")
+            extra = st.text_area("Additional local admission details")
+            c4,c5 = st.columns(2)
+            with c4: clinician = st.text_input("Admitting clinician")
+            with c5: adm_nurse = st.text_input("Admitting nurse / staff ID *")
+            submit_adm = st.form_submit_button("Save admission")
+        if submit_adm:
+            def do_admission():
+                if not reason.strip(): raise ValueError("Admission reason is required.")
+                staff = staff_required(adm_nurse)
+                if ga_w == 0 and ga_d != 0: raise ValueError("Enter completed gestational weeks before additional days.")
+                if birth_w is not None: valid_number("Birth weight",birth_w,1,10000,required=True)
+                if adm_w is not None: valid_number("Admission weight",adm_w,1,10000,required=True)
+                if adm_date > date.today(): raise ValueError("Admission date cannot be in the future.")
+                existing = rows("SELECT id FROM admissions WHERE patient_id=? AND status='Active'",(pmap[pkey],))
+                if existing: raise ValueError("This patient already has an active admission. Close that episode before creating another.")
+                aid = insert("INSERT INTO admissions(patient_id,admission_date,admission_time,gestational_age_weeks,gestational_age_days,birth_weight_g,admission_weight_g,delivery_mode,apgar_1,apgar_5,referring_facility,admission_reason,maternal_perinatal_history,resuscitation,initial_condition,respiratory_support,oxygen_or_support_settings,lines_devices,allergies,infection_risk,initial_nursing_assessment,nursing_priorities,admitting_clinician,admitting_nurse,status,admission_record_json,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (pmap[pkey],adm_date.isoformat(),adm_time.strftime("%H:%M"),int(ga_w) if ga_w else None,int(ga_d),birth_w,adm_w,delivery,clean(apgar1),clean(apgar5),clean(referring),reason.strip(),clean(maternal),clean(resuscitation),clean(condition),support,clean(settings),clean(lines),clean(allergies),clean(infection),clean(assessment),clean(priorities),clean(clinician),staff,"Active",json.dumps({"additional_details":clean(extra)},ensure_ascii=False),utc_now()),actor,"admission",f"Patient record {pmap[pkey]}")
+                st.success(f"Admission episode #{aid} saved.")
+                st.rerun()
+            notify_error(do_admission)
+    st.divider(); st.subheader("Close an admission")
+    open_adms = rows("SELECT a.id,p.hospital_patient_id,p.patient_label,a.admission_date FROM admissions a JOIN patients p ON p.id=a.patient_id WHERE a.status='Active' ORDER BY a.id DESC")
+    if open_adms:
+        amap = {f"Episode #{r['id']} · {r['hospital_patient_id']} · {r['patient_label']} · {r['admission_date']}":r['id'] for r in open_adms}
+        with st.form("discharge_form"):
+            discharge_key = st.selectbox("Active episode",list(amap))
+            dc_date = st.date_input("Discharge / transfer date",value=date.today(),key="dc_date")
+            dc_time = st.time_input("Discharge / transfer time",value=datetime.now().time().replace(second=0,microsecond=0),key="dc_time")
+            dc_summary = st.text_area("Discharge / transfer summary *")
+            confirm_dc = st.checkbox("I verified this is the correct episode and documented the approved disposition.")
+            submit_dc = st.form_submit_button("Close admission")
+        if submit_dc:
+            if not confirm_dc or not dc_summary.strip(): st.error("Confirmation and a discharge/transfer summary are required.")
+            elif dc_date > date.today(): st.error("Discharge date cannot be in the future.")
             else:
-                try:
-                    new_adm = save(
-                        """INSERT INTO admissions(
-                            patient_id, admission_date, admission_time, gestational_age_weeks,
-                            gestational_age_days, birth_weight_g, admission_weight_g, delivery_mode,
-                            apgar_1, apgar_5, referring_facility, admission_reason,
-                            maternal_perinatal_history, resuscitation, initial_condition,
-                            respiratory_support, oxygen_or_support_settings, lines_devices,
-                            allergies, infection_risk, initial_nursing_assessment, nursing_priorities,
-                            admitting_clinician, admitting_nurse, admission_record_json, created_utc
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            patient_map[patient_key], adm_date.isoformat(), adm_time.strftime("%H:%M"),
-                            ga_weeks or None, int(ga_days), birth_weight or None, admission_weight or None,
-                            delivery, as_optional(apgar1), as_optional(apgar5), as_optional(referring),
-                            reason.strip(), as_optional(maternal_history), as_optional(resuscitation),
-                            as_optional(initial_condition), support, as_optional(settings), as_optional(lines),
-                            as_optional(allergies), as_optional(infection), as_optional(initial_assessment),
-                            as_optional(priorities), as_optional(clinician), admitting_nurse.strip(),
-                            json.dumps({"additional_admission_details": extra_record.strip() or None}, ensure_ascii=False),
-                            utc_now(),
-                        ),
-                    )
-                    st.success(f"Admission saved as episode #{new_adm}. It is now available in the sidebar.")
-                    st.rerun()
-                except sqlite3.Error as exc:
-                    st.error(f"Could not save admission: {exc}")
+                aid=amap[discharge_key]
+                with db() as conn: conn.execute("UPDATE admissions SET status='Closed',discharge_date=?,discharge_time=?,discharge_summary=? WHERE id=? AND status='Active'",(dc_date.isoformat(),dc_time.strftime("%H:%M"),dc_summary.strip(),aid))
+                audit(actor,"CLOSE_ADMISSION","admission",aid,"Admission closed by authorized workflow")
+                st.success("Admission closed."); st.rerun()
+    else: st.caption("No active episodes to close.")
 
-
-# Linked clinical forms require an active admission.
-if admission_id is None:
-    for idx in range(2, 10):
-        with sections[idx]:
-            st.info("Register a patient and create an active admission before documenting care.")
+# Require selected active episode for clinical forms.
+context = rows("SELECT a.*,p.hospital_patient_id,p.patient_label FROM admissions a JOIN patients p ON p.id=a.patient_id WHERE a.id=? AND a.status='Active'",(admission_id,)) if admission_id else []
+if not context:
+    for idx in range(3,11):
+        with sections[idx]: st.info("Select an active admission in the sidebar. If none exists, register a patient and create an admission.")
 else:
-    context_rows = fetchall("""
-        SELECT a.*, p.hospital_patient_id, p.patient_label, p.date_of_birth, p.sex
-        FROM admissions a JOIN patients p ON p.id=a.patient_id WHERE a.id=?
-    """, (admission_id,))
-    selected_admission = context_rows[0]
+    current = context[0]
     with st.sidebar:
-        st.divider()
-        st.markdown(f"**Selected patient:** {selected_admission['patient_label']}")
-        st.caption(f"MRN: {selected_admission['hospital_patient_id']} · Episode #{admission_id}")
-        st.caption(f"Admission: {selected_admission['admission_date']}")
+        st.markdown(f"**Selected:** {current['patient_label']}")
+        st.caption(f"MRN: {current['hospital_patient_id']} · Episode #{admission_id}")
 
-    # 3. Head-to-toe assessment
-    with sections[2]:
-        st.subheader("Head-to-toe NICU nursing assessment")
-        with st.form("assessment_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                assess_date, assess_time = show_datetime_inputs("assess", view_date)
-                assess_type = st.selectbox("Assessment type", ["Initial baseline", "Routine shift assessment", "Focused reassessment", "Post-intervention", "Other"])
-                neuro = st.text_area("Neurological: state, tone, activity, reflexes", height=100)
-                respiratory = st.text_area("Respiratory: effort, air entry, support, secretions", height=100)
-            with c2:
-                cardiovascular = st.text_area("Cardiovascular: HR, perfusion, pulses, capillary refill", height=100)
-                skin = st.text_area("Thermoregulation / skin: temperature, colour, integrity", height=100)
-                gi = st.text_area("GI / feeding: abdomen, feeds, tolerance, emesis, stool", height=100)
-                gu = st.text_area("Genitourinary: urine / output", height=80)
-            with c3:
-                musculoskeletal = st.text_area("Musculoskeletal: movement, posture, symmetry", height=90)
-                pain = st.text_input("Pain / comfort tool and score")
-                device_assess = st.text_area("Lines, tubes and devices: site, security, condition", height=90)
-                infection_assess = st.text_area("Infection risks, precautions, relevant findings", height=90)
-                developmental = st.text_area("Developmental care and family involvement", height=90)
-            findings = st.text_area("Findings, nursing interventions and evaluation", height=100)
-            escalation = st.text_area("Escalation / clinician notified / time / response", height=80)
-            nurse = st.text_input("Assessing nurse name / staff ID", key="assess_nurse")
-            save_assess = st.form_submit_button("Save assessment")
-        if save_assess:
-            if not nurse.strip():
-                st.error("Nurse name or staff ID is required.")
-            else:
-                save(
-                    """INSERT INTO assessments(
-                        admission_id, assessment_date, assessment_time, assessment_type,
-                        neurological, respiratory, cardiovascular, thermoregulation_skin,
-                        gastrointestinal_feeding, genitourinary, musculoskeletal, pain_comfort,
-                        lines_tubes_devices, infection_risk, developmental_family_care,
-                        findings_interventions, escalation_actions, nurse_name, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id, assess_date.isoformat(), assess_time.strftime("%H:%M"),
-                        assess_type, as_optional(neuro), as_optional(respiratory),
-                        as_optional(cardiovascular), as_optional(skin), as_optional(gi),
-                        as_optional(gu), as_optional(musculoskeletal), as_optional(pain),
-                        as_optional(device_assess), as_optional(infection_assess),
-                        as_optional(developmental), as_optional(findings), as_optional(escalation),
-                        nurse.strip(), utc_now(),
-                    ),
-                )
-                st.success("Assessment saved.")
-
-    # 4. Vital signs
+    # 3 Head-to-toe assessment
     with sections[3]:
-        st.subheader("Vital signs and monitoring chart")
-        with st.form("observation_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                obs_date, obs_time = show_datetime_inputs("obs", view_date)
-                hr = st.number_input("Heart rate (bpm)", min_value=0.0, max_value=350.0, value=None, step=1.0, placeholder="Measured value")
-                rr = st.number_input("Respiratory rate (/min)", min_value=0.0, max_value=200.0, value=None, step=1.0, placeholder="Measured value")
-            with c2:
-                temp = st.number_input("Temperature (°C)", min_value=20.0, max_value=45.0, value=None, step=0.1, placeholder="Measured value")
-                spo2 = st.number_input("SpO₂ (%)", min_value=0.0, max_value=100.0, value=None, step=1.0, placeholder="Measured value")
-                fio2 = st.number_input("FiO₂ (%)", min_value=21.0, max_value=100.0, value=None, step=1.0, placeholder="If applicable")
-                bp = st.text_input("Blood pressure (include units / site)")
-            with c3:
-                pain_score = st.text_input("Pain tool and score")
-                respiratory_support = st.selectbox("Respiratory support", ["Not documented", "Room air", "Oxygen", "HFNC", "CPAP", "NIPPV", "Mechanical ventilation", "Other"])
-                support_settings = st.text_input("Support settings / interface")
-                refill = st.selectbox("Capillary refill", ["Not assessed", "Within locally expected range", "Delayed / abnormal", "Other / details in note"])
-            obs_nurse = st.text_input("Recording nurse name / staff ID", key="obs_nurse")
-            obs_note = st.text_area("Clinical observation / action / escalation", max_chars=3000)
-            save_obs = st.form_submit_button("Save observation")
-        if save_obs:
-            if not obs_nurse.strip():
-                st.error("Nurse name or staff ID is required.")
-            elif all(v is None for v in [hr, rr, temp, spo2, fio2]) and not obs_note.strip():
-                st.error("Enter at least one measured observation or a clinical note.")
-            else:
-                try:
-                    for label, value, lo, hi in [
-                        ("Heart rate", hr, 0, 350), ("Respiratory rate", rr, 0, 200),
-                        ("Temperature", temp, 20, 45), ("SpO₂", spo2, 0, 100), ("FiO₂", fio2, 21, 100),
-                    ]:
-                        if value is not None and (not math.isfinite(float(value)) or not lo <= float(value) <= hi):
-                            raise ValueError(f"{label} value is invalid.")
-                    save(
-                        """INSERT INTO observations(
-                            admission_id, observation_date, observation_time, heart_rate, respiratory_rate,
-                            temperature_c, spo2_percent, fio2_percent, blood_pressure, pain_score,
-                            respiratory_support, support_settings, capillary_refill, nurse_name, note, created_utc
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            admission_id, obs_date.isoformat(), obs_time.strftime("%H:%M"), hr, rr, temp,
-                            spo2, fio2, as_optional(bp), as_optional(pain_score), respiratory_support,
-                            as_optional(support_settings), refill, obs_nurse.strip(), as_optional(obs_note), utc_now(),
-                        ),
-                    )
-                    st.success("Observation saved.")
-                except (ValueError, sqlite3.Error) as exc:
-                    st.error(f"Could not save observation: {exc}")
+        st.subheader("Head-to-toe assessment")
+        with st.form("assessment_form",clear_on_submit=True):
+            d,t=date_time_fields("assess",default_date)
+            atype=st.selectbox("Assessment type",["Initial baseline","Routine shift assessment","Focused reassessment","Post-intervention","Other"])
+            c1,c2,c3=st.columns(3)
+            with c1: neuro=st.text_area("Neurological: state, tone, activity, reflexes"); resp=st.text_area("Respiratory: effort, air entry, support")
+            with c2: cardio=st.text_area("Cardiovascular: rate, perfusion, pulses, CRT"); skin=st.text_area("Temperature, colour, skin integrity"); gi=st.text_area("GI / feeding / abdomen / stool")
+            with c3: gu=st.text_area("Genitourinary / output"); ms=st.text_area("Movement / posture / symmetry"); pain=st.text_input("Pain tool and score"); devices=st.text_area("Lines / tubes / devices"); inf=st.text_area("Infection risks / precautions"); dev=st.text_area("Developmental care / family involvement")
+            findings=st.text_area("Findings, interventions and evaluation"); escalation=st.text_area("Escalation, person notified, time and response"); nurse=st.text_input("Assessing nurse / staff ID")
+            submit=st.form_submit_button("Save assessment")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                rid=insert("INSERT INTO assessments(admission_id,assessment_date,assessment_time,assessment_type,neurological,respiratory,cardiovascular,thermoregulation_skin,gastrointestinal_feeding,genitourinary,musculoskeletal,pain_comfort,lines_tubes_devices,infection_risk,developmental_family_care,findings_interventions,escalation_actions,nurse_name,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),t.strftime('%H:%M'),atype,clean(neuro),clean(resp),clean(cardio),clean(skin),clean(gi),clean(gu),clean(ms),clean(pain),clean(devices),clean(inf),clean(dev),clean(findings),clean(escalation),staff,utc_now()),actor,"assessment")
+                st.success(f"Assessment #{rid} saved.")
+            notify_error(do)
 
-    # 5. Fluid balance
+    # 4 Vital signs
     with sections[4]:
-        st.subheader("Fluid intake and output chart")
-        st.caption("Use actual measured values for a defined, non-overlapping interval. Use 0 only when confirmed zero.")
-        with st.form("fluid_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                fluid_date = st.date_input("Record date", value=view_date, key="fluid_date")
-                start_time = st.time_input("Interval start", value=time(0, 0), key="fluid_start")
-                end_time = st.time_input("Interval end", value=time(1, 0), key="fluid_end")
-                weight_g = st.number_input("Measured weight used (g)", min_value=0.0, max_value=10000.0, value=None, step=10.0, placeholder="Measured weight")
-                iv = st.number_input("IV fluids (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                feeds = st.number_input("Enteral feeds (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-            with c2:
-                med_ml = st.number_input("Medication fluid volume (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                blood_ml = st.number_input("Blood products (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                other_in = st.number_input("Other intake (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-            with c3:
-                urine = st.number_input("Urine (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                stools = st.number_input("Stool count", min_value=0, max_value=100, value=None, step=1, placeholder="Count")
-                emesis = st.number_input("Emesis (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                drains = st.number_input("Drain output (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-                other_out = st.number_input("Other output (mL)", min_value=0.0, max_value=10000.0, value=None, step=0.5, placeholder="Measured volume")
-            fluid_nurse = st.text_input("Recording nurse name / staff ID", key="fluid_nurse")
-            fluid_notes = st.text_area("Notes / source of measurements")
-            save_fluid = st.form_submit_button("Calculate and save interval")
-        
-        if save_fluid:
-            try:
-                fluid_nurse = validate_staff_name(fluid_nurse)
+        st.subheader("Vital signs and monitoring")
+        st.caption("Technical input validation is not a clinical reference range. Use locally approved neonatal thresholds and clinical assessment.")
+        with st.form("observation_form",clear_on_submit=True):
+            d,t=date_time_fields("obs",default_date)
+            c1,c2,c3=st.columns(3)
+            with c1: hr=st.number_input("Heart rate (bpm)",min_value=0.0,max_value=350.0,value=None,step=1.0); rr=st.number_input("Respiratory rate (/min)",min_value=0.0,max_value=200.0,value=None,step=1.0)
+            with c2: temp=st.number_input("Temperature (°C)",min_value=20.0,max_value=45.0,value=None,step=0.1); spo2=st.number_input("SpO₂ (%)",min_value=0.0,max_value=100.0,value=None,step=1.0); fio2=st.number_input("FiO₂ (%)",min_value=21.0,max_value=100.0,value=None,step=1.0)
+            with c3: bp=st.text_input("Blood pressure with units/site"); pain=st.text_input("Pain tool / score"); support=st.selectbox("Respiratory support",["Not documented","Room air","Oxygen","HFNC","CPAP","NIPPV","Mechanical ventilation","Other"]); settings=st.text_input("Support settings / interface")
+            crt=st.selectbox("Capillary refill",["Not assessed","Within locally expected range","Delayed / abnormal","Other / details in note"])
+            nurse=st.text_input("Recording nurse / staff ID"); note=st.text_area("Clinical note, action and escalation")
+            submit=st.form_submit_button("Save observation")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                vals=[("Heart rate",hr,0,350),("Respiratory rate",rr,0,200),("Temperature",temp,20,45),("SpO₂",spo2,0,100),("FiO₂",fio2,21,100)]
+                for label,val,lo,hi in vals: valid_number(label,val,lo,hi)
+                if all(v is None for _,v,_,_ in vals) and not note.strip(): raise ValueError("Enter at least one measurement or a clinical note.")
+                rid=insert("INSERT INTO observations(admission_id,observation_date,observation_time,heart_rate,respiratory_rate,temperature_c,spo2_percent,fio2_percent,blood_pressure,pain_score,respiratory_support,support_settings,capillary_refill,nurse_name,note,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),t.strftime('%H:%M'),hr,rr,temp,spo2,fio2,clean(bp),clean(pain),support,clean(settings),crt,staff,clean(note),utc_now()),actor,"observation")
+                st.success(f"Observation #{rid} saved.")
+            notify_error(do)
+        recent=rows("SELECT observation_date AS Date,observation_time AS Time,heart_rate AS HR,respiratory_rate AS RR,temperature_c AS 'Temp °C',spo2_percent AS 'SpO₂ %',fio2_percent AS 'FiO₂ %',blood_pressure AS BP,respiratory_support AS Support,nurse_name AS Staff,note AS Note FROM observations WHERE admission_id=? ORDER BY observation_date DESC,observation_time DESC,id DESC LIMIT 30",(admission_id,))
+        if recent: st.dataframe(pd.DataFrame([dict(r) for r in recent]),use_container_width=True,hide_index=True)
 
-                weight_g = validate_measurement(
-                    "Measured weight (g)",
-                    weight_g,
-                    1,
-                    10000,
-                    allow_zero=False,
-                )
-
-                field_names = [
-                    "IV intake",
-                    "Feeds",
-                    "Medication volume",
-                    "Blood products",
-                    "Other intake",
-                    "Urine output",
-                    "Emesis",
-                    "Drain output",
-                    "Other output",
-                ]
-
-                volumes = [
-                    iv, feeds, med_ml, blood_ml, other_in,
-                    urine, emesis, drains, other_out,
-                ]
-
-                if any(v is None for v in volumes) or stools is None:
-                    raise ValueError(
-                        "Complete every intake/output field. "
-                        "Enter 0 only when zero is confirmed."
-                    )
-
-                volumes = [
-                    validate_measurement(name, value, 0, 10000)
-                    for name, value in zip(field_names, volumes)
-                ]
-
-                if not isinstance(stools, int) or stools < 0:
-                    raise ValueError(
-                        "Stool count must be a non-negative whole number."
-                    )
-
-                (
-                    iv, feeds, med_ml, blood_ml, other_in,
-                    urine, emesis, drains, other_out,
-                ) = volumes
-
-                duration_h = validate_time_order(start_time, end_time)
-
-                intake = float(
-                    iv + feeds + med_ml + blood_ml + other_in
-                )
-                output = float(
-                    urine + emesis + drains + other_out
-                )
-                net = intake - output
-
-                urine_rate = (
-                    float(urine)
-                    / (float(weight_g) / 1000)
-                    / duration_h
-                )
-
-                save(
-                    """INSERT INTO fluid_records(
-                        admission_id, record_date, interval_start,
-                        interval_end, weight_g, iv_ml, feeds_ml,
-                        medication_ml, blood_products_ml, other_intake_ml,
-                        urine_ml, stool_count, emesis_ml, drains_ml,
-                        other_output_ml, total_intake_ml, total_output_ml,
-                        net_balance_ml, urine_output_ml_kg_hr,
-                        nurse_name, notes, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id,
-                        fluid_date.isoformat(),
-                        start_time.strftime("%H:%M"),
-                        end_time.strftime("%H:%M"),
-                        weight_g,
-                        iv,
-                        feeds,
-                        med_ml,
-                        blood_ml,
-                        other_in,
-                        urine,
-                        stools,
-                        emesis,
-                        drains,
-                        other_out,
-                        intake,
-                        output,
-                        net,
-                        urine_rate,
-                        fluid_nurse,
-                        as_optional(fluid_notes),
-                        utc_now(),
-                    ),
-                )
-
-                st.success("Fluid balance record saved successfully.")
-
-                st.write(f"**Interval duration:** {duration_h:.2f} hours")
-                st.write(f"**Total intake:** {intake:.2f} mL")
-                st.write(f"**Total output:** {output:.2f} mL")
-                st.write(f"**Net balance:** {net:.2f} mL")
-                st.write(
-                    "**Calculated urine output:** "
-                    f"{urine_rate:.3f} mL/kg/hour"
-                )
-
-            except ValueError as exc:
-                st.error(str(exc))
-            except Exception:
-                st.error(
-                    "The fluid-balance record could not be saved. "
-                    "Check the application logs before retrying."
-                )
-
-
-    # 6. Medication administration record
+    # 5 Fluid balance
     with sections[5]:
-        st.subheader("Medication administration record (MAR)")
-        st.warning("Document against a verified prescription and local neonatal medication policy. This form does not prescribe or authorize doses.")
-        with st.form("med_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                med_date = st.date_input("Record date", value=view_date, key="med_date")
-                med_name = st.text_input("Medication name as prescribed *")
-                prescribed_dose = st.text_input("Prescribed dose and units *")
-                route = st.selectbox("Route *", ["Select route", "Oral / enteral", "IV", "IM", "SC", "Inhaled / nebulized", "Topical", "Other / per prescription"])
-                frequency = st.text_input("Frequency / schedule")
-                scheduled_time = st.text_input("Scheduled time (HH:MM or as prescribed)")
-                med_status = st.selectbox("Administration status", ["Administered", "Withheld", "Omitted / not given", "Delayed", "Refused", "Other"])
-            with c2:
-                actual_time = st.text_input("Actual administration time (HH:MM)")
-                med_weight = st.number_input("Weight referenced by prescription (g, if applicable)", min_value=0.0, max_value=10000.0, value=None, step=10.0, placeholder="If applicable")
-                allergy_check = st.selectbox("Allergy status checked", ["Select status", "Checked; none known documented", "Known allergy reviewed", "Unable to verify; escalated", "Not applicable per policy"])
-                double_check = st.selectbox("Independent double-check", ["Not indicated by policy", "Completed per policy", "Required but not completed; escalated", "Not applicable / local policy"])
-                med_nurse = st.text_input("Administering nurse name / staff ID *")
-                indication = st.text_input("Indication / prescription reference")
-            omit_reason = st.text_area("Reason if withheld, omitted, delayed or not given")
-            response = st.text_area("Response, monitoring, adverse effects or notes")
-            save_med = st.form_submit_button("Save medication record")
-        if save_med:
-            if not med_name.strip() or not prescribed_dose.strip() or route == "Select route" or not med_nurse.strip():
-                st.error("Medication, prescribed dose, route and nurse identification are required.")
-            elif allergy_check == "Select status":
-                st.error("Record the allergy-status check.")
-            elif med_status != "Administered" and not omit_reason.strip():
-                st.error("Document the reason when medication was not administered as scheduled.")
-            else:
-                save(
-                    """INSERT INTO medication_records(
-                        admission_id, record_date, medication_name, prescribed_dose, route, frequency,
-                        scheduled_time, status, actual_administration_time, weight_used_g, allergy_check,
-                        double_check, nurse_name, indication, withheld_or_omitted_reason, response_or_notes, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id, med_date.isoformat(), med_name.strip(), prescribed_dose.strip(),
-                        route, as_optional(frequency), as_optional(scheduled_time), med_status,
-                        as_optional(actual_time), med_weight, allergy_check, double_check, med_nurse.strip(),
-                        as_optional(indication), as_optional(omit_reason), as_optional(response), utc_now(),
-                    ),
-                )
-                st.success("Medication administration record saved.")
+        st.subheader("Fluid intake and output")
+        st.caption("Enter measured values only. Use zero only when confirmed. The interval may cross midnight; overlapping intervals must be avoided by the care team.")
+        with st.form("fluid_form",clear_on_submit=True):
+            d=st.date_input("Interval start date",value=default_date,key="fluid_date")
+            c1,c2,c3=st.columns(3)
+            with c1: start=st.time_input("Interval start time",value=time(0,0),key="fluid_start"); end=st.time_input("Interval end time",value=time(1,0),key="fluid_end"); weight=st.number_input("Measured weight used (g) *",min_value=0.0,max_value=10000.0,value=None,step=10.0)
+            with c2: iv=st.number_input("IV fluids (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); feeds=st.number_input("Enteral feeds (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); med=st.number_input("Medication fluid (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); blood=st.number_input("Blood products (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); other_in=st.number_input("Other intake (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5)
+            with c3: urine=st.number_input("Urine (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); stools=st.number_input("Stool count",min_value=0,max_value=100,value=None,step=1); emesis=st.number_input("Emesis (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); drains=st.number_input("Drain output (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5); other_out=st.number_input("Other output (mL)",min_value=0.0,max_value=10000.0,value=None,step=0.5)
+            nurse=st.text_input("Recording nurse / staff ID"); notes=st.text_area("Measurement notes / source")
+            submit=st.form_submit_button("Calculate and save interval")
+        if submit:
+            def do():
+                staff=staff_required(nurse); w=valid_number("Weight",weight,1,10000,required=True)
+                names=["IV intake","Feeds","Medication fluid","Blood products","Other intake","Urine","Emesis","Drain output","Other output"]
+                vals=[iv,feeds,med,blood,other_in,urine,emesis,drains,other_out]
+                if any(v is None for v in vals) or stools is None: raise ValueError("Complete all intake/output fields. Use 0 only when confirmed.")
+                vals=[valid_number(n,v,0,10000,required=True) for n,v in zip(names,vals)]
+                if not isinstance(stools,int) or stools<0: raise ValueError("Stool count must be a whole number of zero or more.")
+                start_dt,end_dt,hours=interval_datetimes(d,start,end)
+                # The date field denotes the start date; a cross-midnight interval stores its actual end date/time.
+                total_in=sum(vals[:5]); total_out=sum(vals[5:]); net=total_in-total_out
+                urine_rate=vals[5]/(w/1000)/hours
+                if not math.isfinite(urine_rate): raise ValueError("Urine output calculation is invalid; check weight and interval.")
+                overlap=rows("SELECT id,interval_start_utc,interval_end_utc FROM fluid_records WHERE admission_id=? AND interval_start_utc IS NOT NULL AND interval_end_utc IS NOT NULL AND interval_start_utc < ? AND interval_end_utc > ?",(admission_id,end_dt.isoformat(),start_dt.isoformat()))
+                if overlap: raise ValueError("This interval overlaps an existing fluid record. Review the existing chart before saving.")
+                rid=insert("INSERT INTO fluid_records(admission_id,record_date,interval_start,interval_end,interval_start_utc,interval_end_utc,duration_hours,weight_g,iv_ml,feeds_ml,medication_ml,blood_products_ml,other_intake_ml,urine_ml,stool_count,emesis_ml,drains_ml,other_output_ml,total_intake_ml,total_output_ml,net_balance_ml,urine_output_ml_kg_hr,nurse_name,notes,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),start_dt.strftime('%H:%M'),end_dt.strftime('%H:%M'),start_dt.isoformat(),end_dt.isoformat(),hours,w,*vals[:5],vals[5],stools,vals[6],vals[7],vals[8],total_in,total_out,net,urine_rate,staff,clean(notes),utc_now()),actor,"fluid_record",f"Duration {hours:.2f} h")
+                st.success(f"Fluid record #{rid} saved.")
+                a,b,c,e=st.columns(4); a.metric("Duration",f"{hours:.2f} h"); b.metric("Total intake",f"{total_in:.2f} mL"); c.metric("Total output",f"{total_out:.2f} mL"); e.metric("Net balance",f"{net:.2f} mL")
+                st.metric("Calculated urine output",f"{urine_rate:.3f} mL/kg/hour",help="Arithmetic result only; interpret clinically using verified measurements, local guidance and the patient's condition.")
+            notify_error(do)
+        fluids=rows("SELECT record_date AS 'Start date',interval_start AS Start,interval_end AS End,duration_hours AS 'Duration h',weight_g AS 'Weight g',total_intake_ml AS 'Intake mL',total_output_ml AS 'Output mL',net_balance_ml AS 'Net mL',urine_output_ml_kg_hr AS 'Urine mL/kg/h',nurse_name AS Staff,notes AS Notes FROM fluid_records WHERE admission_id=? ORDER BY record_date DESC,id DESC LIMIT 30",(admission_id,))
+        if fluids: st.dataframe(pd.DataFrame([dict(r) for r in fluids]),use_container_width=True,hide_index=True)
 
-    # 7. Equipment safety check
+    # 6 Medication MAR
     with sections[6]:
-        st.subheader("Equipment safety check and handover")
-        with st.form("equipment_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
+        st.subheader("Medication administration record")
+        st.warning("Record against a verified prescription and local neonatal medication policy. This form does not calculate, prescribe, or authorize a dose.")
+        with st.form("med_form",clear_on_submit=True):
+            c1,c2=st.columns(2)
             with c1:
-                eq_date, eq_time = show_datetime_inputs("eq", view_date)
-                eq_type = st.selectbox("Equipment type", ["Incubator", "Radiant warmer", "Patient monitor", "CPAP / NIPPV", "Ventilator", "Oxygen delivery", "Suction", "Infusion pump", "Syringe pump", "Phototherapy", "Other"])
-                eq_id = st.text_input("Asset / equipment identifier")
-                assigned = st.selectbox("Patient and equipment assignment verified", ["Select", "Yes", "No; escalated", "Not applicable"])
-                condition = st.selectbox("Physical condition", ["Select", "No visible damage noted", "Damage / concern identified", "Not checked"])
-                function_check = st.selectbox("Function check", ["Select", "Passed per local checklist", "Failed; removed from use / escalated", "Not completed"])
-                alarm_check = st.selectbox("Alarm check", ["Not applicable", "Passed per local checklist", "Failed; escalated", "Not checked"])
+                d=st.date_input("Record date",value=default_date,key="med_date"); name=st.text_input("Medication name as prescribed *"); dose=st.text_input("Prescribed dose and units *"); route=st.selectbox("Route",["Select route","Oral / enteral","IV","IM","SC","Inhaled / nebulized","Topical","Other / per prescription"]); freq=st.text_input("Frequency / schedule"); sched=st.text_input("Scheduled time (HH:MM or as prescribed)"); status=st.selectbox("Status",["Administered","Withheld","Omitted / not given","Delayed","Refused","Other"])
             with c2:
-                power_gas = st.selectbox("Power / gas / connection check", ["Not applicable", "Passed per local checklist", "Issue identified; escalated", "Not checked"])
-                consumables = st.selectbox("Consumables / accessories", ["Not applicable", "Available and appropriate", "Restock needed", "Issue identified"])
-                cleaning = st.selectbox("Cleaning / decontamination status", ["Not documented", "Completed per policy", "Required before use", "Concern / escalated"])
-                fault = st.text_area("Fault or issue identified")
-                action = st.text_area("Action taken")
-                ticket = st.text_input("Maintenance ticket / escalation reference")
-                outgoing = st.text_input("Outgoing staff")
-                incoming = st.text_input("Incoming staff")
-                eq_nurse = st.text_input("Person completing check name / staff ID *")
-            eq_notes = st.text_area("Additional notes")
-            save_eq = st.form_submit_button("Save equipment check")
-        if save_eq:
-            if assigned == "Select" or condition == "Select" or function_check == "Select" or not eq_nurse.strip():
-                st.error("Complete patient assignment, physical condition, function check and staff identification.")
-            elif (condition == "Damage / concern identified" or function_check.startswith("Failed") or alarm_check.startswith("Failed") or power_gas.startswith("Issue")) and not (fault.strip() or action.strip() or ticket.strip()):
-                st.error("For an identified fault, document the issue and action or escalation reference.")
-            else:
-                save(
-                    """INSERT INTO equipment_checks(
-                        admission_id, check_date, check_time, equipment_type, equipment_identifier,
-                        assigned_patient_confirmed, physical_condition, function_check, alarm_check,
-                        power_gas_check, consumables_check, cleaning_status, fault_or_issue, action_taken,
-                        escalation_or_ticket, outgoing_staff, incoming_staff, nurse_name, notes, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id, eq_date.isoformat(), eq_time.strftime("%H:%M"), eq_type,
-                        as_optional(eq_id), assigned, condition, function_check, alarm_check, power_gas,
-                        consumables, cleaning, as_optional(fault), as_optional(action), as_optional(ticket),
-                        as_optional(outgoing), as_optional(incoming), eq_nurse.strip(), as_optional(eq_notes), utc_now(),
-                    ),
-                )
-                st.success("Equipment check saved.")
+                actual=st.text_input("Actual administration time (HH:MM)"); weight=st.number_input("Weight referenced by prescription (g, if applicable)",min_value=0.0,max_value=10000.0,value=None,step=10.0); allergy=st.selectbox("Allergy status",["Select status","Checked; none known documented","Known allergy reviewed","Unable to verify; escalated","Not applicable per policy"]); double=st.selectbox("Independent double-check",["Not indicated by policy","Completed per policy","Required but not completed; escalated","Not applicable / local policy"]); nurse=st.text_input("Administering nurse / staff ID *"); indication=st.text_input("Indication / prescription reference")
+            reason=st.text_area("Reason if withheld / omitted / delayed"); response=st.text_area("Response / adverse effects / monitoring")
+            submit=st.form_submit_button("Save medication record")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                if not name.strip() or not dose.strip() or route=="Select route": raise ValueError("Medication, prescribed dose and route are required.")
+                if allergy=="Select status": raise ValueError("Record allergy status.")
+                if status!="Administered" and not reason.strip(): raise ValueError("Document why the medication was not administered as scheduled.")
+                if status=="Administered" and not actual.strip(): raise ValueError("Enter the actual administration time, or select a status that reflects what occurred.")
+                if actual.strip():
+                    try: datetime.strptime(actual.strip(),"%H:%M")
+                    except ValueError: raise ValueError("Actual administration time must use HH:MM format.")
+                if sched.strip():
+                    try: datetime.strptime(sched.strip(),"%H:%M")
+                    except ValueError: raise ValueError("Scheduled time must use HH:MM format or leave it blank if not applicable.")
+                if weight is not None: valid_number("Prescription reference weight",weight,1,10000)
+                rid=insert("INSERT INTO medication_records(admission_id,record_date,medication_name,prescribed_dose,route,frequency,scheduled_time,status,actual_administration_time,weight_used_g,allergy_check,double_check,nurse_name,indication,withheld_or_omitted_reason,response_or_notes,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),name.strip(),dose.strip(),route,clean(freq),clean(sched),status,clean(actual),weight,allergy,double,staff,clean(indication),clean(reason),clean(response),utc_now()),actor,"medication_record")
+                st.success(f"Medication record #{rid} saved.")
+            notify_error(do)
+        meds=rows("SELECT record_date AS Date,medication_name AS Medication,prescribed_dose AS Dose,route AS Route,status AS Status,scheduled_time AS Scheduled,actual_administration_time AS Actual,withheld_or_omitted_reason AS Reason,nurse_name AS Staff FROM medication_records WHERE admission_id=? ORDER BY record_date DESC,id DESC LIMIT 50",(admission_id,))
+        if meds: st.dataframe(pd.DataFrame([dict(r) for r in meds]),use_container_width=True,hide_index=True)
 
-    # 8. Shift handover
+    # 7 Equipment
     with sections[7]:
-        st.subheader("Nursing shift handover · SBAR")
-        with st.form("handover_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
+        st.subheader("Equipment safety check")
+        with st.form("equipment_form",clear_on_submit=True):
+            d,t=date_time_fields("eq",default_date)
+            c1,c2=st.columns(2)
             with c1:
-                hand_date, hand_time = show_datetime_inputs("hand", view_date)
-                shift = st.selectbox("Shift", ["Day", "Evening", "Night", "Other"])
-                outgoing_nurse = st.text_input("Outgoing nurse *")
-                incoming_nurse = st.text_input("Incoming nurse *")
+                typ=st.selectbox("Equipment type",["Incubator","Radiant warmer","Patient monitor","CPAP / NIPPV","Ventilator","Oxygen delivery","Suction","Infusion pump","Syringe pump","Phototherapy","Other"]); identifier=st.text_input("Asset identifier"); assigned=st.selectbox("Patient / equipment assignment",["Select","Verified","Mismatch; escalated","Not applicable"]); condition=st.selectbox("Physical condition",["Select","No visible damage noted","Damage / concern identified","Not checked"]); function=st.selectbox("Function check",["Select","Passed per local checklist","Failed; removed from use / escalated","Not completed"]); alarm=st.selectbox("Alarm check",["Not applicable","Passed per local checklist","Failed; escalated","Not checked"])
             with c2:
-                situation = st.text_area("S · Situation / current concern *", height=100)
-                background = st.text_area("B · Background / diagnosis / history", height=100)
-                assessment_summary = st.text_area("A · Assessment / current status", height=100)
-                recommendations = st.text_area("R · Recommendations / priorities", height=100)
-            with c3:
-                airway = st.text_area("Airway / respiratory support", height=80)
-                fluids_feeding = st.text_area("Fluids, feeding and elimination", height=80)
-                meds_pending = st.text_area("Medication due / pending", height=80)
-                lines_equipment = st.text_area("Lines, devices and equipment concerns", height=80)
-            investigations = st.text_area("Pending tests / investigations / consultations")
-            safety_concerns = st.text_area("Safety concerns / infection precautions")
-            escalation_plan = st.text_area("Escalation plan / contact instructions")
-            acknowledgement = st.text_area("Handover acknowledgement / questions clarified")
-            save_hand = st.form_submit_button("Save shift handover")
-        if save_hand:
-            if not all(x.strip() for x in [outgoing_nurse, incoming_nurse, situation]):
-                st.error("Outgoing nurse, incoming nurse and situation are required.")
-            else:
-                save(
-                    """INSERT INTO handovers(
-                        admission_id, handover_date, handover_time, shift, outgoing_nurse, incoming_nurse,
-                        situation, background, assessment_summary, recommendations, airway_respiratory,
-                        fluids_feeding_elimination, medication_due_or_pending, lines_devices_equipment,
-                        investigations_pending, safety_concerns, escalation_plan, acknowledgement, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id, hand_date.isoformat(), hand_time.strftime("%H:%M"), shift,
-                        outgoing_nurse.strip(), incoming_nurse.strip(), situation.strip(), as_optional(background),
-                        as_optional(assessment_summary), as_optional(recommendations), as_optional(airway),
-                        as_optional(fluids_feeding), as_optional(meds_pending), as_optional(lines_equipment),
-                        as_optional(investigations), as_optional(safety_concerns), as_optional(escalation_plan),
-                        as_optional(acknowledgement), utc_now(),
-                    ),
-                )
-                st.success("Shift handover saved.")
+                power=st.selectbox("Power / gas / connection",["Not applicable","Passed per local checklist","Issue identified; escalated","Not checked"]); consumables=st.selectbox("Consumables / accessories",["Not applicable","Available and appropriate","Restock needed","Issue identified"]); cleaning=st.selectbox("Cleaning status",["Not documented","Completed per policy","Required before use","Concern / escalated"]); fault=st.text_area("Fault / issue"); action=st.text_area("Action taken"); ticket=st.text_input("Maintenance ticket / escalation reference"); nurse=st.text_input("Staff completing check *")
+            outgoing=st.text_input("Outgoing staff"); incoming=st.text_input("Incoming staff"); notes=st.text_area("Additional notes")
+            submit=st.form_submit_button("Save equipment check")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                if assigned=="Select" or condition=="Select" or function=="Select": raise ValueError("Complete assignment, physical condition and function check.")
+                issue=condition=="Damage / concern identified" or function.startswith("Failed") or alarm.startswith("Failed") or power.startswith("Issue") or consumables=="Issue identified"
+                if issue and not any(x.strip() for x in [fault,action,ticket]): raise ValueError("Document the issue and action or escalation reference.")
+                rid=insert("INSERT INTO equipment_checks(admission_id,check_date,check_time,equipment_type,equipment_identifier,assigned_patient_confirmed,physical_condition,function_check,alarm_check,power_gas_check,consumables_check,cleaning_status,fault_or_issue,action_taken,escalation_or_ticket,outgoing_staff,incoming_staff,nurse_name,notes,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),t.strftime('%H:%M'),typ,clean(identifier),assigned,condition,function,alarm,power,consumables,cleaning,clean(fault),clean(action),clean(ticket),clean(outgoing),clean(incoming),staff,clean(notes),utc_now()),actor,"equipment_check")
+                st.success(f"Equipment check #{rid} saved.")
+            notify_error(do)
+        eqs=rows("SELECT check_date AS Date,check_time AS Time,equipment_type AS Equipment,equipment_identifier AS Identifier,physical_condition AS Condition,function_check AS Function,alarm_check AS Alarm,fault_or_issue AS Fault,action_taken AS Action,nurse_name AS Staff FROM equipment_checks WHERE admission_id=? ORDER BY check_date DESC,check_time DESC,id DESC LIMIT 50",(admission_id,))
+        if eqs: st.dataframe(pd.DataFrame([dict(r) for r in eqs]),use_container_width=True,hide_index=True)
 
-    # 9. Nursing care plan
+    # 8 Handover
     with sections[8]:
-        st.subheader("Individualized NICU nursing care plan")
-        st.caption(
-            "Link assessment findings to a nursing problem, measurable goals, planned care, "
-            "implementation, and evaluation. Use clinical judgment and local neonatal protocols."
-        )
-        with st.expander("Care plan workflow", expanded=True):
-            st.markdown(
-                "1. **Assess:** document relevant cues and verified findings.\n"
-                "2. **Identify:** record the nursing diagnosis or problem supported by those findings.\n"
-                "3. **Plan:** set measurable outcomes and timeframes.\n"
-                "4. **Implement:** record planned interventions and what was actually performed.\n"
-                "5. **Evaluate:** compare the patient's response with the expected outcomes and revise the plan as appropriate."
-            )
-        with st.form("nursing_care_plan_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                plan_date = st.date_input("Plan initiated", value=view_date, key="ncp_date")
-                review_date = st.date_input("Next review date", value=view_date, key="ncp_review_date")
-                priority = st.selectbox("Priority", ["Immediate / high", "High", "Moderate", "Low"])
-                plan_status = st.selectbox("Care-plan status", ["Active", "On hold", "Discontinued", "Completed"])
-            with c2:
-                problem = st.text_area(
-                    "Nursing diagnosis / identified problem *",
-                    placeholder="State the patient-specific problem supported by assessment findings.",
-                    height=145,
-                )
-                cues = st.text_area(
-                    "Assessment cues / supporting evidence",
-                    placeholder="Observed signs, symptoms, measurements, risks, relevant history.",
-                    height=145,
-                )
-            with c3:
-                goals = st.text_area(
-                    "Expected outcomes / measurable goals *",
-                    placeholder="Write observable outcomes and a target timeframe.",
-                    height=145,
-                )
-                interventions = st.text_area(
-                    "Planned nursing interventions *",
-                    placeholder="Individualized nursing actions, monitoring, safety measures, and escalation criteria.",
-                    height=145,
-                )
-            frequency = st.text_area(
-                "Frequency / schedule",
-                placeholder="Record prescribed or locally approved frequency; do not infer it.",
-            )
-            implementation = st.text_area(
-                "Implementation notes",
-                placeholder="Record care actually provided, including relevant dates/times.",
-            )
-            evaluation = st.text_area(
-                "Evaluation / response to care",
-                placeholder="Compare observed findings with the expected outcomes.",
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                evaluation_status = st.selectbox(
-                    "Outcome evaluation",
-                    ["Ongoing", "Achieved", "Partially achieved", "Not achieved", "Unable to evaluate"],
-                )
-                nurse_name = st.text_input("Responsible nurse name / staff ID *", key="ncp_nurse")
-            with c2:
-                reviewer_name = st.text_input("Reviewer / next-shift nurse (optional)")
-                escalation = st.text_area("Communication / escalation", placeholder="Person/team notified, time, response, follow-up.")
-            save_plan = st.form_submit_button("Save nursing care plan")
-        if save_plan:
-            if not problem.strip() or not goals.strip() or not interventions.strip():
-                st.error("Problem/diagnosis, expected outcomes, and planned interventions are required.")
-            elif not nurse_name.strip():
-                st.error("Responsible nurse name or staff ID is required.")
-            elif review_date < plan_date:
-                st.error("Next review date cannot be earlier than the plan initiation date.")
-            else:
-                try:
-                    save(
-                        """INSERT INTO nursing_care_plans(
-                            admission_id, plan_date, review_date, priority, status,
-                            problem_or_diagnosis, assessment_cues, goals_outcomes, interventions,
-                            frequency_or_schedule, implementation_notes, evaluation, evaluation_status,
-                            escalation_or_communication, nurse_name, reviewer_name, created_utc, updated_utc
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            admission_id, plan_date.isoformat(), review_date.isoformat(), priority,
-                            plan_status, problem.strip(), as_optional(cues), goals.strip(), interventions.strip(),
-                            as_optional(frequency), as_optional(implementation), as_optional(evaluation),
-                            evaluation_status, as_optional(escalation), nurse_name.strip(),
-                            as_optional(reviewer_name), utc_now(), utc_now(),
-                        ),
-                    )
-                    st.success("Nursing care plan saved and linked to the selected admission.")
-                except sqlite3.Error as exc:
-                    st.error(f"Could not save nursing care plan: {exc}")
+        st.subheader("Shift handover · SBAR")
+        with st.form("handover_form",clear_on_submit=True):
+            d,t=date_time_fields("hand",default_date); shift=st.selectbox("Shift",["Day","Evening","Night","Other"])
+            c1,c2,c3=st.columns(3)
+            with c1: outgoing=st.text_input("Outgoing nurse *"); incoming=st.text_input("Incoming nurse *"); situation=st.text_area("S · Situation / current concern *")
+            with c2: background=st.text_area("B · Background / history"); assess=st.text_area("A · Assessment / status"); recs=st.text_area("R · Recommendations / priorities")
+            with c3: airway=st.text_area("Airway / respiratory support"); fluids=st.text_area("Fluids / feeds / elimination"); meds=st.text_area("Medication due / pending"); lines=st.text_area("Lines / devices / equipment")
+            investigations=st.text_area("Pending investigations / consultations"); safety=st.text_area("Safety concerns / infection precautions"); escalation=st.text_area("Escalation plan"); ack=st.text_area("Acknowledgement / clarifications")
+            submit=st.form_submit_button("Save handover")
+        if submit:
+            def do():
+                if not outgoing.strip() or not incoming.strip() or not situation.strip(): raise ValueError("Outgoing nurse, incoming nurse and situation are required.")
+                rid=insert("INSERT INTO handovers(admission_id,handover_date,handover_time,shift,outgoing_nurse,incoming_nurse,situation,background,assessment_summary,recommendations,airway_respiratory,fluids_feeding_elimination,medication_due_or_pending,lines_devices_equipment,investigations_pending,safety_concerns,escalation_plan,acknowledgement,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),t.strftime('%H:%M'),shift,outgoing.strip(),incoming.strip(),situation.strip(),clean(background),clean(assess),clean(recs),clean(airway),clean(fluids),clean(meds),clean(lines),clean(investigations),clean(safety),clean(escalation),clean(ack),utc_now()),actor,"handover")
+                st.success(f"Handover #{rid} saved.")
+            notify_error(do)
+        hand=rows("SELECT handover_date AS Date,handover_time AS Time,shift AS Shift,outgoing_nurse AS Outgoing,incoming_nurse AS Incoming,situation AS Situation,recommendations AS Recommendations FROM handovers WHERE admission_id=? ORDER BY handover_date DESC,handover_time DESC,id DESC LIMIT 30",(admission_id,))
+        if hand: st.dataframe(pd.DataFrame([dict(r) for r in hand]),use_container_width=True,hide_index=True)
 
-        st.divider()
-        st.subheader("Care plans for this admission")
-        plan_rows = fetchall(
-            """SELECT id, plan_date AS 'Plan date', review_date AS 'Review date',
-                      priority AS Priority, status AS Status,
-                      problem_or_diagnosis AS 'Nursing problem',
-                      goals_outcomes AS 'Expected outcomes',
-                      evaluation_status AS 'Evaluation status',
-                      nurse_name AS 'Responsible nurse',
-                      reviewer_name AS Reviewer, updated_utc AS 'Updated UTC'
-               FROM nursing_care_plans
-               WHERE admission_id=? ORDER BY plan_date DESC, id DESC""",
-            (admission_id,),
-        )
-        if plan_rows:
-            plan_df = pd.DataFrame([dict(r) for r in plan_rows])
-            st.dataframe(plan_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Export care plans as CSV",
-                plan_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"admission_{admission_id}_nursing_care_plans.csv",
-                mime="text/csv",
-                key=f"export_care_plans_{admission_id}",
-            )
-            with st.expander("View full care-plan details"):
-                full_plans = fetchall(
-                    "SELECT * FROM nursing_care_plans WHERE admission_id=? ORDER BY plan_date DESC, id DESC",
-                    (admission_id,),
-                )
-                for p in full_plans:
-                    with st.container(border=True):
-                        st.markdown(f"**Plan #{p['id']} · {p['plan_date']} · {p['priority']} · {p['status']}**")
-                        st.markdown(f"**Problem / diagnosis:** {p['problem_or_diagnosis']}")
-                        st.markdown(f"**Assessment cues:** {p['assessment_cues'] or 'Not recorded'}")
-                        st.markdown(f"**Expected outcomes:** {p['goals_outcomes']}")
-                        st.markdown(f"**Planned interventions:** {p['interventions']}")
-                        st.markdown(f"**Frequency / schedule:** {p['frequency_or_schedule'] or 'Not recorded'}")
-                        st.markdown(f"**Implementation:** {p['implementation_notes'] or 'Not recorded'}")
-                        st.markdown(f"**Evaluation:** {p['evaluation'] or 'Not recorded'}")
-                        st.markdown(f"**Outcome status:** {p['evaluation_status']}")
-                        st.markdown(f"**Communication / escalation:** {p['escalation_or_communication'] or 'Not recorded'}")
-                        st.caption(
-                            f"Responsible nurse: {p['nurse_name']} · Reviewer: {p['reviewer_name'] or 'Not recorded'} · "
-                            f"Created UTC: {p['created_utc']} · Updated UTC: {p['updated_utc']}"
-                        )
-        else:
-            st.info("No nursing care plans have been saved for this admission yet.")
-
-    # 10. Progress notes and history
+    # 9 Care plan
     with sections[9]:
-        st.subheader("Nursing progress notes")
-        with st.form("progress_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                note_date, note_time = show_datetime_inputs("progress", view_date)
-                note_type = st.selectbox("Note type", ["Routine progress", "Focused reassessment", "Intervention", "Communication / escalation", "Incident follow-up", "Other"])
-                note_nurse = st.text_input("Nurse name / staff ID *", key="progress_nurse")
-            with c2:
-                note_assessment = st.text_area("Assessment / observed facts")
-                note_intervention = st.text_area("Nursing intervention / care provided")
-                note_response = st.text_area("Response / evaluation")
-                note_communication = st.text_area("Communication, clinician notified and response")
-            save_note = st.form_submit_button("Save progress note")
-        if save_note:
-            if not note_nurse.strip() or not any(x.strip() for x in [note_assessment, note_intervention, note_response, note_communication]):
-                st.error("Nurse identification and at least one note field are required.")
-            else:
-                save(
-                    """INSERT INTO progress_notes(
-                        admission_id, note_date, note_time, note_type, assessment,
-                        nursing_intervention, response_evaluation, communication_escalation,
-                        nurse_name, created_utc
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        admission_id, note_date.isoformat(), note_time.strftime("%H:%M"), note_type,
-                        as_optional(note_assessment), as_optional(note_intervention), as_optional(note_response),
-                        as_optional(note_communication), note_nurse.strip(), utc_now(),
-                    ),
-                )
-                st.success("Progress note saved.")
+        st.subheader("Individualized nursing care plan")
+        st.caption("Record patient-specific findings, measurable outcomes, interventions actually planned, and evaluation. Use clinical judgment and approved local protocols.")
+        with st.form("care_plan_form",clear_on_submit=True):
+            c1,c2,c3=st.columns(3)
+            with c1: pdte=st.date_input("Plan date",value=default_date,key="plan_date"); review=st.date_input("Review date",value=default_date,key="plan_review"); priority=st.selectbox("Priority",["Immediate / high","High","Moderate","Low"]); status=st.selectbox("Status",["Active","On hold","Discontinued","Completed"])
+            with c2: problem=st.text_area("Nursing problem / diagnosis *"); cues=st.text_area("Assessment cues / evidence")
+            with c3: goals=st.text_area("Measurable expected outcomes *"); interventions=st.text_area("Planned nursing interventions *")
+            frequency=st.text_area("Frequency / schedule (approved plan)"); implementation=st.text_area("Implementation notes: care actually provided"); evaluation=st.text_area("Evaluation / response"); eval_status=st.selectbox("Outcome evaluation",["Ongoing","Achieved","Partially achieved","Not achieved","Unable to evaluate"]); nurse=st.text_input("Responsible nurse / staff ID"); reviewer=st.text_input("Reviewer / next-shift nurse"); escalation=st.text_area("Communication / escalation")
+            submit=st.form_submit_button("Save care plan")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                if not problem.strip() or not goals.strip() or not interventions.strip(): raise ValueError("Problem, measurable outcomes and interventions are required.")
+                if review<pdte: raise ValueError("Review date cannot precede plan date.")
+                rid=insert("INSERT INTO nursing_care_plans(admission_id,plan_date,review_date,priority,status,problem_or_diagnosis,assessment_cues,goals_outcomes,interventions,frequency_or_schedule,implementation_notes,evaluation,evaluation_status,escalation_or_communication,nurse_name,reviewer_name,created_utc,updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(admission_id,pdte.isoformat(),review.isoformat(),priority,status,problem.strip(),clean(cues),goals.strip(),interventions.strip(),clean(frequency),clean(implementation),clean(evaluation),eval_status,clean(escalation),staff,clean(reviewer),utc_now(),utc_now()),actor,"nursing_care_plan")
+                st.success(f"Care plan #{rid} saved.")
+            notify_error(do)
+        plans=rows("SELECT id,plan_date AS 'Plan date',review_date AS 'Review date',priority AS Priority,status AS Status,problem_or_diagnosis AS Problem,goals_outcomes AS Outcomes,evaluation_status AS Evaluation,nurse_name AS Staff,reviewer_name AS Reviewer FROM nursing_care_plans WHERE admission_id=? ORDER BY plan_date DESC,id DESC",(admission_id,))
+        csv_export(plans,f"admission_{admission_id}_care_plans.csv",f"care_plans_{admission_id}")
+        full=rows("SELECT * FROM nursing_care_plans WHERE admission_id=? ORDER BY plan_date DESC,id DESC",(admission_id,))
+        for plan in full:
+            with st.expander(f"Plan #{plan['id']} · {plan['plan_date']} · {plan['status']}"):
+                for label,key in [("Problem","problem_or_diagnosis"),("Assessment cues","assessment_cues"),("Expected outcomes","goals_outcomes"),("Interventions","interventions"),("Frequency","frequency_or_schedule"),("Implementation","implementation_notes"),("Evaluation","evaluation"),("Communication / escalation","escalation_or_communication")]:
+                    st.markdown(f"**{label}:** {plan[key] or 'Not recorded'}")
+                st.caption(f"Evaluation: {plan['evaluation_status']} · Responsible: {plan['nurse_name']} · Reviewer: {plan['reviewer_name'] or 'Not recorded'}")
 
-        st.divider()
-        st.subheader("Chronological record history")
-        history_tabs = st.tabs([
-            "Admission", "Assessments", "Observations", "Fluid balance", "Medication",
-            "Equipment", "Handovers", "Care plans", "Progress notes",
-        ])
-        history_queries = [
-            ("Admission", """SELECT admission_date AS Date, admission_time AS Time,
-                admission_reason AS Summary, admitting_nurse AS Staff, status AS Status,
-                admission_record_json AS 'Additional details', created_utc AS 'Saved UTC'
-                FROM admissions WHERE id=?""", (admission_id,)),
-            ("Assessments", """SELECT assessment_date AS Date, assessment_time AS Time,
-                assessment_type AS Type, neurological AS Neurological, respiratory AS Respiratory,
-                cardiovascular AS Cardiovascular, findings_interventions AS Findings,
-                escalation_actions AS Escalation, nurse_name AS Staff, created_utc AS 'Saved UTC'
-                FROM assessments WHERE admission_id=? ORDER BY assessment_date DESC, assessment_time DESC, id DESC""", (admission_id,)),
-            ("Observations", """SELECT observation_date AS Date, observation_time AS Time,
-                heart_rate AS HR, respiratory_rate AS RR, temperature_c AS 'Temp C',
-                spo2_percent AS 'SpO2 %', fio2_percent AS 'FiO2 %', blood_pressure AS BP,
-                respiratory_support AS Support, support_settings AS 'Support settings',
-                nurse_name AS Staff, note AS Note, created_utc AS 'Saved UTC'
-                FROM observations WHERE admission_id=? ORDER BY observation_date DESC, observation_time DESC, id DESC""", (admission_id,)),
-            ("Fluid balance", """SELECT record_date AS Date, interval_start AS Start, interval_end AS End,
-                total_intake_ml AS 'Intake mL', total_output_ml AS 'Output mL',
-                net_balance_ml AS 'Net mL', urine_output_ml_kg_hr AS 'Urine mL/kg/hr',
-                nurse_name AS Staff, notes AS Notes, created_utc AS 'Saved UTC'
-                FROM fluid_records WHERE admission_id=? ORDER BY record_date DESC, interval_start DESC, id DESC""", (admission_id,)),
-            ("Medication", """SELECT record_date AS Date, medication_name AS Medication,
-                prescribed_dose AS 'Prescribed dose', route AS Route, status AS Status,
-                scheduled_time AS 'Scheduled time', actual_administration_time AS 'Actual time',
-                withheld_or_omitted_reason AS 'Reason if not given', nurse_name AS Staff,
-                created_utc AS 'Saved UTC'
-                FROM medication_records WHERE admission_id=? ORDER BY record_date DESC, id DESC""", (admission_id,)),
-            ("Equipment", """SELECT check_date AS Date, check_time AS Time, equipment_type AS Equipment,
-                equipment_identifier AS Identifier, physical_condition AS Condition,
-                function_check AS 'Function check', fault_or_issue AS Fault, action_taken AS Action,
-                nurse_name AS Staff, created_utc AS 'Saved UTC'
-                FROM equipment_checks WHERE admission_id=? ORDER BY check_date DESC, check_time DESC, id DESC""", (admission_id,)),
-            ("Handovers", """SELECT handover_date AS Date, handover_time AS Time, shift AS Shift,
-                outgoing_nurse AS Outgoing, incoming_nurse AS Incoming, situation AS Situation,
-                recommendations AS Recommendations, created_utc AS 'Saved UTC'
-                FROM handovers WHERE admission_id=? ORDER BY handover_date DESC, handover_time DESC, id DESC""", (admission_id,)),
-            ("Care plans", """SELECT plan_date AS 'Plan date', review_date AS 'Review date',
-                priority AS Priority, status AS Status, problem_or_diagnosis AS 'Nursing problem',
-                goals_outcomes AS 'Expected outcomes', evaluation_status AS 'Evaluation status',
-                nurse_name AS Staff, reviewer_name AS Reviewer, updated_utc AS 'Updated UTC'
-                FROM nursing_care_plans WHERE admission_id=? ORDER BY plan_date DESC, id DESC""", (admission_id,)),
-            ("Progress notes", """SELECT note_date AS Date, note_time AS Time, note_type AS Type,
-                assessment AS Assessment, nursing_intervention AS Intervention,
-                response_evaluation AS Response, communication_escalation AS Communication,
-                nurse_name AS Staff, created_utc AS 'Saved UTC'
-                FROM progress_notes WHERE admission_id=? ORDER BY note_date DESC, note_time DESC, id DESC""", (admission_id,)),
+    # 10 Progress notes and record history
+    with sections[10]:
+        st.subheader("Nursing progress notes")
+        with st.form("progress_form",clear_on_submit=True):
+            d,t=date_time_fields("progress",default_date); kind=st.selectbox("Note type",["Routine progress","Focused reassessment","Intervention","Communication / escalation","Incident follow-up","Other"]); nurse=st.text_input("Nurse / staff ID")
+            c1,c2=st.columns(2)
+            with c1: assessment=st.text_area("Assessment / observed facts"); intervention=st.text_area("Intervention / care provided")
+            with c2: response=st.text_area("Response / evaluation"); communication=st.text_area("Communication, clinician notified and response")
+            submit=st.form_submit_button("Save progress note")
+        if submit:
+            def do():
+                staff=staff_required(nurse)
+                if not any(x.strip() for x in [assessment,intervention,response,communication]): raise ValueError("Enter at least one progress-note field.")
+                rid=insert("INSERT INTO progress_notes(admission_id,note_date,note_time,note_type,assessment,nursing_intervention,response_evaluation,communication_escalation,nurse_name,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?)",(admission_id,d.isoformat(),t.strftime('%H:%M'),kind,clean(assessment),clean(intervention),clean(response),clean(communication),staff,utc_now()),actor,"progress_note")
+                st.success(f"Progress note #{rid} saved.")
+            notify_error(do)
+        st.divider(); st.subheader("Chronological record history")
+        hist_tabs=st.tabs(["Admission","Assessments","Observations","Fluid balance","Medication","Equipment","Handovers","Care plans","Progress notes"])
+        hist_queries=[
+          ("Admission","SELECT admission_date AS Date,admission_time AS Time,admission_reason AS Summary,admitting_nurse AS Staff,status AS Status,discharge_date AS 'Discharge date',discharge_summary AS 'Discharge summary',created_utc AS 'Saved UTC' FROM admissions WHERE id=?",(admission_id,)),
+          ("Assessments","SELECT assessment_date AS Date,assessment_time AS Time,assessment_type AS Type,neurological AS Neurological,respiratory AS Respiratory,cardiovascular AS Cardiovascular,findings_interventions AS Findings,escalation_actions AS Escalation,nurse_name AS Staff,created_utc AS 'Saved UTC' FROM assessments WHERE admission_id=? ORDER BY assessment_date DESC,assessment_time DESC,id DESC",(admission_id,)),
+          ("Observations","SELECT observation_date AS Date,observation_time AS Time,heart_rate AS HR,respiratory_rate AS RR,temperature_c AS 'Temp °C',spo2_percent AS 'SpO₂ %',fio2_percent AS 'FiO₂ %',blood_pressure AS BP,respiratory_support AS Support,nurse_name AS Staff,note AS Note,created_utc AS 'Saved UTC' FROM observations WHERE admission_id=? ORDER BY observation_date DESC,observation_time DESC,id DESC",(admission_id,)),
+          ("Fluid balance","SELECT record_date AS 'Start date',interval_start AS Start,interval_end AS End,interval_start_utc AS 'Start datetime',interval_end_utc AS 'End datetime',duration_hours AS 'Duration h',total_intake_ml AS 'Intake mL',total_output_ml AS 'Output mL',net_balance_ml AS 'Net mL',urine_output_ml_kg_hr AS 'Urine mL/kg/h',nurse_name AS Staff,notes AS Notes FROM fluid_records WHERE admission_id=? ORDER BY record_date DESC,id DESC",(admission_id,)),
+          ("Medication","SELECT record_date AS Date,medication_name AS Medication,prescribed_dose AS Dose,route AS Route,status AS Status,scheduled_time AS Scheduled,actual_administration_time AS Actual,withheld_or_omitted_reason AS Reason,nurse_name AS Staff,created_utc AS 'Saved UTC' FROM medication_records WHERE admission_id=? ORDER BY record_date DESC,id DESC",(admission_id,)),
+          ("Equipment","SELECT check_date AS Date,check_time AS Time,equipment_type AS Equipment,equipment_identifier AS Identifier,physical_condition AS Condition,function_check AS Function,alarm_check AS Alarm,fault_or_issue AS Fault,action_taken AS Action,nurse_name AS Staff,created_utc AS 'Saved UTC' FROM equipment_checks WHERE admission_id=? ORDER BY check_date DESC,check_time DESC,id DESC",(admission_id,)),
+          ("Handovers","SELECT handover_date AS Date,handover_time AS Time,shift AS Shift,outgoing_nurse AS Outgoing,incoming_nurse AS Incoming,situation AS Situation,recommendations AS Recommendations,created_utc AS 'Saved UTC' FROM handovers WHERE admission_id=? ORDER BY handover_date DESC,handover_time DESC,id DESC",(admission_id,)),
+          ("Care plans","SELECT plan_date AS 'Plan date',review_date AS 'Review date',priority AS Priority,status AS Status,problem_or_diagnosis AS Problem,goals_outcomes AS Outcomes,evaluation_status AS Evaluation,nurse_name AS Staff,reviewer_name AS Reviewer,updated_utc AS 'Updated UTC' FROM nursing_care_plans WHERE admission_id=? ORDER BY plan_date DESC,id DESC",(admission_id,)),
+          ("Progress notes","SELECT note_date AS Date,note_time AS Time,note_type AS Type,assessment AS Assessment,nursing_intervention AS Intervention,response_evaluation AS Response,communication_escalation AS Communication,nurse_name AS Staff,created_utc AS 'Saved UTC' FROM progress_notes WHERE admission_id=? ORDER BY note_date DESC,note_time DESC,id DESC",(admission_id,)),
         ]
-        for tab, (name, sql, params) in zip(history_tabs, history_queries):
+        for tab,(name,sql,params) in zip(hist_tabs,hist_queries):
             with tab:
-                rows = fetchall(sql, params)
-                if rows:
-                    # Render additional admission JSON as a readable object in its own expander.
-                    row_dicts = [dict(r) for r in rows]
-                    if name == "Admission":
-                        for item in row_dicts:
-                            raw = item.get("Additional details")
-                            if raw:
-                                try:
-                                    item["Additional details"] = json.dumps(json.loads(raw), ensure_ascii=False, indent=2)
-                                except (TypeError, json.JSONDecodeError):
-                                    pass
-                    df = pd.DataFrame(row_dicts)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        f"Export {name} as CSV",
-                        df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"admission_{admission_id}_{name.lower().replace(' ', '_')}.csv",
-                        mime="text/csv",
-                        key=f"export_{name}_{admission_id}",
-                    )
-                else:
-                    st.info(f"No {name.lower()} records have been saved for this admission.")
+                result=rows(sql,params)
+                if result: csv_export(result,f"admission_{admission_id}_{name.lower().replace(' ','_')}.csv",f"hist_{name}_{admission_id}")
+                else: st.info(f"No {name.lower()} records for this admission.")
 
 st.divider()
-st.caption(
-    "Every form starts blank. Enter only verified observations and information from the clinical record. "
-    "This prototype is not a substitute for the hospital's approved charting system."
-)
+st.caption("Today Nurse · Enter only verified information. Use the institution's approved charting system for patient care. Audit events provide a tamper-evident hash chain for basic detection only; they are not a substitute for a protected external audit service.")
