@@ -365,7 +365,9 @@ with st.sidebar:
 # Workflow tabs
 # ---------------------------------------------------------------------------
 
+
 sections = st.tabs([
+    "Dashboard",
     "1 · Patient registry",
     "2 · Initial admission",
     "3 · Head-to-toe assessment",
@@ -377,6 +379,7 @@ sections = st.tabs([
     "9 · Nursing care plan",
     "10 · Progress notes & history",
 ])
+
 
 # 1. Patient registry
 with sections[0]:
