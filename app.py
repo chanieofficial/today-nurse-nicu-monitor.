@@ -34,6 +34,58 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def validate_measurement(
+    label: str,
+    value: float | int | None,
+    minimum: float,
+    maximum: float,
+    *,
+    allow_zero: bool = True,
+) -> float | None:
+    """Validate a measured numeric value. Never infer missing data."""
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}: enter a valid numeric value.") from exc
+
+    if not math.isfinite(number):
+        raise ValueError(f"{label}: value must be finite.")
+
+    if number < minimum or number > maximum:
+        raise ValueError(
+            f"{label}: value must be between {minimum} and {maximum}."
+        )
+
+    if not allow_zero and number == 0:
+        raise ValueError(f"{label}: value must be greater than zero.")
+
+    return number
+
+
+def validate_staff_name(name: str) -> str:
+    """Require a non-empty staff identifier."""
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Staff name or staff ID is required.")
+    return cleaned
+
+
+def validate_time_order(start, end) -> float:
+    """Validate same-day intervals; overnight intervals need explicit dates."""
+    start_minutes = start.hour * 60 + start.minute
+    end_minutes = end.hour * 60 + end.minute
+
+    if end_minutes <= start_minutes:
+        raise ValueError(
+            "The end time must be later than the start time. "
+            "Overnight intervals need an explicit end date."
+        )
+
+    return (end_minutes - start_minutes) / 60.0
+
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
