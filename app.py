@@ -664,24 +664,77 @@ else:
             fluid_notes = st.text_area("Notes / source of measurements")
             save_fluid = st.form_submit_button("Calculate and save interval")
         if save_fluid:
-            try:
-                if not fluid_nurse.strip():
-                    raise ValueError("Nurse name or staff ID is required.")
-                if weight_g is None or weight_g <= 0:
-                    raise ValueError("Enter the measured weight used for calculation.")
-                volumes = [iv, feeds, med_ml, blood_ml, other_in, urine, emesis, drains, other_out]
-                if any(v is None for v in volumes) or stools is None:
-                    raise ValueError("Complete each intake/output field; enter 0 only when confirmed zero.")
-                start_dt = datetime.combine(fluid_date, start_time)
-                end_dt = datetime.combine(fluid_date, end_time)
-                if end_dt <= start_dt:
-                    raise ValueError("End must be later than start on the selected date. Split overnight intervals across dates.")
-                duration_h = (end_dt - start_dt).total_seconds() / 3600
-                intake = float(iv + feeds + med_ml + blood_ml + other_in)
-                output = float(urine + emesis + drains + other_out)
-                net = intake - output
-                urine_rate = float(urine) / (float(weight_g) / 1000) / duration_h
-                save(
+            
+try:
+    fluid_nurse = validate_staff_name(fluid_nurse)
+
+    weight_g = validate_measurement(
+        "Measured weight (g)",
+        weight_g,
+        1,
+        10000,
+        allow_zero=False,
+    )
+
+    volumes = [
+        iv, feeds, med_ml, blood_ml, other_in,
+        urine, emesis, drains, other_out,
+    ]
+
+    if any(v is None for v in volumes) or stools is None:
+        raise ValueError(
+            "Complete every intake/output field. "
+            "Enter 0 only when zero is confirmed."
+        )
+
+    volumes = [
+        validate_measurement(
+            label,
+            value,
+            0,
+            10000,
+        )
+        for label, value in zip(
+            [
+                "IV intake",
+                "Feeds",
+                "Medication volume",
+                "Blood products",
+                "Other intake",
+                "Urine output",
+                "Emesis",
+                "Drains",
+                "Other output",
+            ],
+            volumes,
+        )
+    ]
+
+    if not isinstance(stools, int) or stools < 0:
+        raise ValueError(
+            "Stool count must be a non-negative whole number."
+        )
+
+    (
+        iv, feeds, med_ml, blood_ml, other_in,
+        urine, emesis, drains, other_out,
+    ) = volumes
+
+    start_dt = datetime.combine(fluid_date, start_time)
+    end_dt = datetime.combine(fluid_date, end_time)
+
+    duration_h = validate_time_order(start_time, end_time)
+
+    intake = float(iv + feeds + med_ml + blood_ml + other_in)
+    output = float(urine + emesis + drains + other_out)
+    net = intake - output
+
+    urine_rate = (
+        float(urine)
+        / (float(weight_g) / 1000)
+        / duration_h
+    )
+
                     """INSERT INTO fluid_records(
                         admission_id, record_date, interval_start, interval_end, weight_g,
                         iv_ml, feeds_ml, medication_ml, blood_products_ml, other_intake_ml,
