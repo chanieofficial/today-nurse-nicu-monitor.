@@ -663,100 +663,128 @@ else:
             fluid_nurse = st.text_input("Recording nurse name / staff ID", key="fluid_nurse")
             fluid_notes = st.text_area("Notes / source of measurements")
             save_fluid = st.form_submit_button("Calculate and save interval")
+        
         if save_fluid:
-            
-try:
-    fluid_nurse = validate_staff_name(fluid_nurse)
+            try:
+                fluid_nurse = validate_staff_name(fluid_nurse)
 
-    weight_g = validate_measurement(
-        "Measured weight (g)",
-        weight_g,
-        1,
-        10000,
-        allow_zero=False,
-    )
+                weight_g = validate_measurement(
+                    "Measured weight (g)",
+                    weight_g,
+                    1,
+                    10000,
+                    allow_zero=False,
+                )
 
-    volumes = [
-        iv, feeds, med_ml, blood_ml, other_in,
-        urine, emesis, drains, other_out,
-    ]
+                field_names = [
+                    "IV intake",
+                    "Feeds",
+                    "Medication volume",
+                    "Blood products",
+                    "Other intake",
+                    "Urine output",
+                    "Emesis",
+                    "Drain output",
+                    "Other output",
+                ]
 
-    if any(v is None for v in volumes) or stools is None:
-        raise ValueError(
-            "Complete every intake/output field. "
-            "Enter 0 only when zero is confirmed."
-        )
+                volumes = [
+                    iv, feeds, med_ml, blood_ml, other_in,
+                    urine, emesis, drains, other_out,
+                ]
 
-    volumes = [
-        validate_measurement(
-            label,
-            value,
-            0,
-            10000,
-        )
-        for label, value in zip(
-            [
-                "IV intake",
-                "Feeds",
-                "Medication volume",
-                "Blood products",
-                "Other intake",
-                "Urine output",
-                "Emesis",
-                "Drains",
-                "Other output",
-            ],
-            volumes,
-        )
-    ]
+                if any(v is None for v in volumes) or stools is None:
+                    raise ValueError(
+                        "Complete every intake/output field. "
+                        "Enter 0 only when zero is confirmed."
+                    )
 
-    if not isinstance(stools, int) or stools < 0:
-        raise ValueError(
-            "Stool count must be a non-negative whole number."
-        )
+                volumes = [
+                    validate_measurement(name, value, 0, 10000)
+                    for name, value in zip(field_names, volumes)
+                ]
 
-    (
-        iv, feeds, med_ml, blood_ml, other_in,
-        urine, emesis, drains, other_out,
-    ) = volumes
+                if not isinstance(stools, int) or stools < 0:
+                    raise ValueError(
+                        "Stool count must be a non-negative whole number."
+                    )
 
-    start_dt = datetime.combine(fluid_date, start_time)
-    end_dt = datetime.combine(fluid_date, end_time)
+                (
+                    iv, feeds, med_ml, blood_ml, other_in,
+                    urine, emesis, drains, other_out,
+                ) = volumes
 
-    duration_h = validate_time_order(start_time, end_time)
+                duration_h = validate_time_order(start_time, end_time)
 
-    intake = float(iv + feeds + med_ml + blood_ml + other_in)
-    output = float(urine + emesis + drains + other_out)
-    net = intake - output
+                intake = float(
+                    iv + feeds + med_ml + blood_ml + other_in
+                )
+                output = float(
+                    urine + emesis + drains + other_out
+                )
+                net = intake - output
 
-    urine_rate = (
-        float(urine)
-        / (float(weight_g) / 1000)
-        / duration_h
-    )
+                urine_rate = (
+                    float(urine)
+                    / (float(weight_g) / 1000)
+                    / duration_h
+                )
 
+                save(
                     """INSERT INTO fluid_records(
-                        admission_id, record_date, interval_start, interval_end, weight_g,
-                        iv_ml, feeds_ml, medication_ml, blood_products_ml, other_intake_ml,
-                        urine_ml, stool_count, emesis_ml, drains_ml, other_output_ml,
-                        total_intake_ml, total_output_ml, net_balance_ml, urine_output_ml_kg_hr,
+                        admission_id, record_date, interval_start,
+                        interval_end, weight_g, iv_ml, feeds_ml,
+                        medication_ml, blood_products_ml, other_intake_ml,
+                        urine_ml, stool_count, emesis_ml, drains_ml,
+                        other_output_ml, total_intake_ml, total_output_ml,
+                        net_balance_ml, urine_output_ml_kg_hr,
                         nurse_name, notes, created_utc
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        admission_id, fluid_date.isoformat(), start_time.strftime("%H:%M"),
-                        end_time.strftime("%H:%M"), weight_g, iv, feeds, med_ml, blood_ml,
-                        other_in, urine, stools, emesis, drains, other_out, intake, output, net,
-                        urine_rate, fluid_nurse.strip(), as_optional(fluid_notes), utc_now(),
+                        admission_id,
+                        fluid_date.isoformat(),
+                        start_time.strftime("%H:%M"),
+                        end_time.strftime("%H:%M"),
+                        weight_g,
+                        iv,
+                        feeds,
+                        med_ml,
+                        blood_ml,
+                        other_in,
+                        urine,
+                        stools,
+                        emesis,
+                        drains,
+                        other_out,
+                        intake,
+                        output,
+                        net,
+                        urine_rate,
+                        fluid_nurse,
+                        as_optional(fluid_notes),
+                        utc_now(),
                     ),
                 )
-                a, b, c, d = st.columns(4)
-                a.metric("Total intake", f"{intake:.1f} mL")
-                b.metric("Total output", f"{output:.1f} mL")
-                c.metric("Net balance", f"{net:+.1f} mL")
-                d.metric("Urine output estimate", f"{urine_rate:.2f} mL/kg/hr")
-                st.success("Fluid interval saved. Confirm calculation conventions with local policy.")
-            except (ValueError, TypeError, sqlite3.Error) as exc:
-                st.error(f"Could not save fluid record: {exc}")
+
+                st.success("Fluid balance record saved successfully.")
+
+                st.write(f"**Interval duration:** {duration_h:.2f} hours")
+                st.write(f"**Total intake:** {intake:.2f} mL")
+                st.write(f"**Total output:** {output:.2f} mL")
+                st.write(f"**Net balance:** {net:.2f} mL")
+                st.write(
+                    "**Calculated urine output:** "
+                    f"{urine_rate:.3f} mL/kg/hour"
+                )
+
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception:
+                st.error(
+                    "The fluid-balance record could not be saved. "
+                    "Check the application logs before retrying."
+                )
+
 
     # 6. Medication administration record
     with sections[5]:
