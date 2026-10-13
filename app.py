@@ -1,4 +1,4 @@
-"""Today Nurse NICU Documentation System v3.0
+"""CHANIE: Comprehensive Healthcare Application for Neonatal Insights & Evaluation
 Educational prototype, not a validated EHR.
 Do not store identifiable patient data until institutional security, privacy,
 clinical governance, disaster recovery, and validation requirements are met.
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 APP_VERSION = "3.0.0"
-APP_TITLE = "Today Nurse | NICU Documentation"
+APP_TITLE = "CHANIE | Neonatal Insights & Evaluation"
 DB_PATH = Path(os.environ.get("TODAY_NURSE_DB_PATH", str(Path(__file__).with_name("today_nurse_nicu.db"))))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -282,7 +282,8 @@ def authenticate() -> str | None:
         return "DEMO USER"
     if st.session_state.get("actor") in users:
         return st.session_state["actor"]
-    st.title("🩺 Today Nurse NICU Documentation")
+    st.title("🩺 CHANIE")
+    st.caption("Comprehensive Healthcare Application for Neonatal Insights & Evaluation")
     st.caption("Sign in with an authorized staff account.")
     with st.form("login_form"):
         username = st.text_input("Staff username")
@@ -304,8 +305,9 @@ actor = authenticate()
 if actor is None:
     st.stop()
 
-st.title("🩺 Today Nurse | NICU Nursing Documentation")
-st.caption(f"Version {APP_VERSION} · Linked clinical documentation · SQLite prototype")
+st.title("🩺 CHANIE")
+st.subheader("Comprehensive Healthcare Application for Neonatal Insights & Evaluation")
+st.caption(f"A Today Nurse digital health project · Version {APP_VERSION} · NICU nursing documentation prototype")
 st.warning("PROTOTYPE SAFETY NOTICE: SQLite file storage is not guaranteed durable on ephemeral hosting. No encryption at rest, institutional identity provider, MFA, formal access controls, verified backup/restore, or clinical validation is provided by this app. Use fictional data only until approved and secured.")
 
 # ---------- Sidebar / active episode ----------
@@ -688,4 +690,4 @@ else:
                 else: st.info(f"No {name.lower()} records for this admission.")
 
 st.divider()
-st.caption("Today Nurse · Enter only verified information. Use the institution's approved charting system for patient care. Audit events provide a tamper-evident hash chain for basic detection only; they are not a substitute for a protected external audit service.")
+st.caption("CHANIE · A Today Nurse digital health project. Enter only verified information. Use the institution's approved charting system for patient care. Audit events provide a tamper-evident hash chain for basic detection only; they are not a substitute for a protected external audit service.")
